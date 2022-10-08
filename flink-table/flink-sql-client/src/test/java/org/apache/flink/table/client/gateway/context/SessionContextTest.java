@@ -21,7 +21,9 @@ package org.apache.flink.table.client.gateway.context;
 import org.apache.flink.client.cli.DefaultCLI;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.configuration.ReadableConfig;
-import org.apache.flink.table.client.gateway.utils.UserDefinedFunctions;
+import org.apache.flink.table.api.TableEnvironment;
+import org.apache.flink.types.Row;
+import org.apache.flink.util.CollectionUtil;
 import org.apache.flink.util.UserClassLoaderJarTestUtils;
 
 import org.junit.Before;
@@ -34,6 +36,7 @@ import java.io.File;
 import java.io.IOException;
 import java.net.URL;
 import java.util.Collections;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
@@ -43,6 +46,8 @@ import static org.apache.flink.configuration.PipelineOptions.NAME;
 import static org.apache.flink.configuration.PipelineOptions.OBJECT_REUSE;
 import static org.apache.flink.core.testutils.FlinkMatchers.containsMessage;
 import static org.apache.flink.table.api.config.TableConfigOptions.TABLE_SQL_DIALECT;
+import static org.apache.flink.table.utils.UserDefinedFunctions.GENERATED_LOWER_UDF_CLASS;
+import static org.apache.flink.table.utils.UserDefinedFunctions.GENERATED_LOWER_UDF_CODE;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.fail;
 import static org.assertj.core.api.HamcrestCondition.matching;
@@ -62,8 +67,8 @@ public class SessionContextTest {
                 UserClassLoaderJarTestUtils.createJarFile(
                         tempFolder.newFolder("test-jar"),
                         "test-classloader-udf.jar",
-                        UserDefinedFunctions.GENERATED_UDF_CLASS,
-                        UserDefinedFunctions.GENERATED_UDF_CODE);
+                        GENERATED_LOWER_UDF_CLASS,
+                        String.format(GENERATED_LOWER_UDF_CODE, GENERATED_LOWER_UDF_CLASS));
     }
 
     @Before
@@ -143,36 +148,6 @@ public class SessionContextTest {
     }
 
     @Test
-    public void testAddJarWithFullPath() throws IOException {
-        validateAddJar(udfJar.getPath());
-    }
-
-    @Test
-    public void testAddJarWithRelativePath() throws IOException {
-        validateAddJar(
-                new File(".").getCanonicalFile().toPath().relativize(udfJar.toPath()).toString());
-    }
-
-    @Test
-    public void testAddIllegalJar() {
-        validateAddJarWithException("/path/to/illegal.jar", "JAR file does not exist");
-    }
-
-    @Test
-    public void testAddRemoteJar() {
-        validateAddJarWithException(
-                "hdfs://remote:10080/remote.jar", "SQL Client only supports to add local jars.");
-    }
-
-    @Test
-    public void testAddIllegalJarInConfig() {
-        Configuration innerConfig = (Configuration) sessionContext.getReadableConfig();
-        innerConfig.set(JARS, Collections.singletonList("/path/to/illegal.jar"));
-
-        validateAddJarWithException(udfJar.getPath(), "no protocol: /path/to/illegal.jar");
-    }
-
-    @Test
     public void testRemoveJarWithFullPath() {
         validateRemoveJar(udfJar.getPath());
     }
@@ -185,7 +160,8 @@ public class SessionContextTest {
 
     @Test
     public void testRemoveIllegalJar() {
-        validateRemoveJarWithException("/path/to/illegal.jar", "JAR file does not exist");
+        validateRemoveJarWithException(
+                "/path/to/illegal.jar", "Failed to unregister the jar resource");
     }
 
     @Test
@@ -194,7 +170,7 @@ public class SessionContextTest {
         innerConfig.set(JARS, Collections.singletonList("hdfs://remote:10080/remote.jar"));
 
         validateRemoveJarWithException(
-                "hdfs://remote:10080/remote.jar", "SQL Client only supports to remove local jars.");
+                "hdfs://remote:10080/remote.jar", "Failed to unregister the jar resource");
     }
 
     // --------------------------------------------------------------------------------------------
@@ -224,34 +200,21 @@ public class SessionContextTest {
         return sessionContext.getExecutionContext().getTableEnvironment().getConfig();
     }
 
-    private void validateAddJar(String jarPath) throws IOException {
-        sessionContext.addJar(jarPath);
-        assertThat(sessionContext.listJars()).containsExactly(udfJar.getPath());
-        assertThat(getConfiguration().get(JARS)).containsExactly(udfJar.toURI().toURL().toString());
-        // reset to the default
-        sessionContext.reset();
-        assertThat(sessionContext.listJars()).containsExactly(udfJar.getPath());
-        assertThat(getConfiguration().get(JARS)).containsExactly(udfJar.toURI().toURL().toString());
-    }
-
     private void validateRemoveJar(String jarPath) {
-        sessionContext.addJar(jarPath);
-        assertThat(sessionContext.listJars()).containsExactly(udfJar.getPath());
+        TableEnvironment tableEnvironment =
+                sessionContext.getExecutionContext().getTableEnvironment();
+        tableEnvironment.executeSql(String.format("ADD JAR '%s'", jarPath));
+
+        List<Row> jars =
+                CollectionUtil.iteratorToList(tableEnvironment.executeSql("SHOW JARS").collect());
+        assertThat(jars).containsExactly(Row.of(udfJar.getPath()));
 
         sessionContext.removeJar(jarPath);
-        assertThat(sessionContext.listJars()).isEmpty();
-    }
 
-    private void validateAddJarWithException(String jarPath, String errorMessages) {
-        Set<URL> originDependencies = sessionContext.getDependencies();
-        try {
-            sessionContext.addJar(jarPath);
-            fail("Should fail.");
-        } catch (Exception e) {
-            assertThat(e).satisfies(matching(containsMessage(errorMessages)));
-            // Keep dependencies as same as before if fail to add jar
-            assertThat(sessionContext.getDependencies()).isEqualTo(originDependencies);
-        }
+        assertThat(
+                        CollectionUtil.iteratorToList(
+                                tableEnvironment.executeSql("SHOW JARS").collect()))
+                .isEmpty();
     }
 
     private void validateRemoveJarWithException(String jarPath, String errorMessages) {

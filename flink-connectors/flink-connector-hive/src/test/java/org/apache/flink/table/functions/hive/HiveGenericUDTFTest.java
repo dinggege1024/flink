@@ -36,6 +36,7 @@ import org.apache.hadoop.hive.ql.udf.generic.GenericUDTFStack;
 import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspector;
 import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspectorConverters;
 import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspectorFactory;
+import org.apache.hadoop.hive.serde2.objectinspector.StandardStructObjectInspector;
 import org.apache.hadoop.hive.serde2.objectinspector.StructObjectInspector;
 import org.apache.hadoop.hive.serde2.objectinspector.primitive.PrimitiveObjectInspectorFactory;
 import org.junit.Test;
@@ -148,8 +149,8 @@ public class HiveGenericUDTFTest {
     }
 
     private static HiveGenericUDTF init(
-            Class hiveUdfClass, Object[] constantArgs, DataType[] argTypes) throws Exception {
-        HiveFunctionWrapper<GenericUDTF> wrapper = new HiveFunctionWrapper(hiveUdfClass.getName());
+            Class<?> hiveUdfClass, Object[] constantArgs, DataType[] argTypes) throws Exception {
+        HiveFunctionWrapper<GenericUDTF> wrapper = new HiveFunctionWrapper<>(hiveUdfClass);
 
         CallContextMock callContext = new CallContextMock();
         callContext.argumentDataTypes = Arrays.asList(argTypes);
@@ -165,7 +166,10 @@ public class HiveGenericUDTFTest {
         ObjectInspector[] argumentInspectors =
                 HiveInspectors.getArgInspectors(
                         hiveShim, HiveFunctionArguments.create(callContext));
-        ObjectInspector returnInspector = wrapper.createFunction().initialize(argumentInspectors);
+        StandardStructObjectInspector standardStructObjectInspector =
+                HiveGenericUDTF.getStandardStructObjectInspector(argumentInspectors);
+        ObjectInspector returnInspector =
+                wrapper.createFunction().initialize(standardStructObjectInspector);
 
         udf.open(null);
 

@@ -18,13 +18,15 @@
 
 package org.apache.flink.table.planner.plan.optimize.program;
 
+import org.apache.flink.table.api.TableException;
 import org.apache.flink.table.catalog.Catalog;
 import org.apache.flink.table.catalog.CatalogPartitionSpec;
 import org.apache.flink.table.catalog.ObjectIdentifier;
 import org.apache.flink.table.catalog.ObjectPath;
+import org.apache.flink.table.catalog.ResolvedCatalogTable;
 import org.apache.flink.table.catalog.exceptions.PartitionNotExistException;
-import org.apache.flink.table.catalog.stats.CatalogColumnStatistics;
-import org.apache.flink.table.catalog.stats.CatalogTableStatistics;
+import org.apache.flink.table.catalog.exceptions.TableNotExistException;
+import org.apache.flink.table.catalog.exceptions.TableNotPartitionedException;
 import org.apache.flink.table.connector.source.DynamicTableSource;
 import org.apache.flink.table.connector.source.abilities.SupportsStatisticReport;
 import org.apache.flink.table.plan.stats.TableStats;
@@ -35,7 +37,6 @@ import org.apache.flink.table.planner.plan.abilities.source.SourceAbilitySpec;
 import org.apache.flink.table.planner.plan.schema.TableSourceTable;
 import org.apache.flink.table.planner.plan.stats.FlinkStatistic;
 import org.apache.flink.table.planner.plan.utils.DefaultRelShuttle;
-import org.apache.flink.table.planner.utils.CatalogTableStatisticsConverter;
 import org.apache.flink.table.planner.utils.ShortcutUtils;
 
 import org.apache.calcite.plan.RelOptTable;
@@ -43,10 +44,18 @@ import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.core.TableScan;
 import org.apache.calcite.rel.logical.LogicalTableScan;
 
+import javax.annotation.Nullable;
+
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
+import java.util.stream.Collectors;
 
 import static org.apache.flink.table.api.config.OptimizerConfigOptions.TABLE_OPTIMIZER_SOURCE_REPORT_STATISTICS_ENABLED;
+import static org.apache.flink.table.planner.utils.CatalogTableStatisticsConverter.convertToAccumulatedTableStates;
 
 /**
  * A FlinkOptimizeProgram that recompute statistics after partition pruning and filter push down.
@@ -116,30 +125,38 @@ public class FlinkRecomputeStatisticsProgram implements FlinkOptimizeProgram<Bat
             return reportStatEnabled
                     ? ((SupportsStatisticReport) tableSource).reportStatistics()
                     : null;
-        } else {
+        } else if (partitionPushDownSpec != null) {
             // ignore filter push down if all pushdown predicates are also in outer Filter operator
             // otherwise the result will be estimated twice.
-            if (partitionPushDownSpec != null) {
-                // partition push down
-                // try to get the statistics for the remaining partitions
-                TableStats newTableStat = getPartitionsTableStats(table, partitionPushDownSpec);
-                // call reportStatistics method if reportStatEnabled is true and the partition
-                // statistics is unknown
-                if (reportStatEnabled && isUnknownTableStats(newTableStat)) {
-                    return ((SupportsStatisticReport) tableSource).reportStatistics();
-                } else {
-                    return newTableStat;
-                }
+            // partition push down
+            // try to get the statistics for the remaining partitions
+            TableStats newTableStat = getPartitionsTableStats(table, partitionPushDownSpec);
+            // call reportStatistics method if reportStatEnabled is true and the partition
+            // statistics is unknown
+            if (reportStatEnabled && isUnknownTableStats(newTableStat)) {
+                return ((SupportsStatisticReport) tableSource).reportStatistics();
             } else {
-                // call reportStatistics method if reportStatEnabled is true and the original
-                // catalog statistics is unknown
-                if (reportStatEnabled && isUnknownTableStats(origTableStats)) {
-                    return ((SupportsStatisticReport) tableSource).reportStatistics();
-                } else {
-                    return origTableStats;
-                }
+                return newTableStat;
+            }
+        } else {
+            if (isPartitionedTable(table) && isUnknownTableStats(origTableStats)) {
+                // if table is partition table, try to recompute stats by catalog.
+                origTableStats = getPartitionsTableStats(table, null);
+            }
+            // call reportStatistics method if reportStatEnabled is true and the newTableStats is
+            // unknown.
+            if (reportStatEnabled && isUnknownTableStats(origTableStats)) {
+                return ((SupportsStatisticReport) tableSource).reportStatistics();
+            } else {
+                return origTableStats;
             }
         }
+    }
+
+    private boolean isPartitionedTable(TableSourceTable table) {
+        return table.contextResolvedTable()
+                .<ResolvedCatalogTable>getResolvedTable()
+                .isPartitioned();
     }
 
     private boolean isUnknownTableStats(TableStats stats) {
@@ -147,45 +164,65 @@ public class FlinkRecomputeStatisticsProgram implements FlinkOptimizeProgram<Bat
     }
 
     private TableStats getPartitionsTableStats(
-            TableSourceTable table, PartitionPushDownSpec partitionPushDownSpec) {
-        TableStats newTableStat = null;
+            TableSourceTable table, @Nullable PartitionPushDownSpec partitionPushDownSpec) {
         if (table.contextResolvedTable().isPermanent()) {
             ObjectIdentifier identifier = table.contextResolvedTable().getIdentifier();
             ObjectPath tablePath = identifier.toObjectPath();
-            Catalog catalog = table.contextResolvedTable().getCatalog().get();
-            for (Map<String, String> partition : partitionPushDownSpec.getPartitions()) {
-                Optional<TableStats> partitionStats =
-                        getPartitionStats(catalog, tablePath, partition);
-                if (!partitionStats.isPresent()) {
-                    // clear all information before
-                    newTableStat = null;
-                    break;
-                } else {
-                    newTableStat =
-                            newTableStat == null
-                                    ? partitionStats.get()
-                                    : newTableStat.merge(partitionStats.get());
-                }
+            Optional<Catalog> optionalCatalog = table.contextResolvedTable().getCatalog();
+            if (!optionalCatalog.isPresent()) {
+                return TableStats.UNKNOWN;
             }
+            Catalog catalog = optionalCatalog.get();
+            List<Map<String, String>> partitionList = new ArrayList<>();
+            if (partitionPushDownSpec == null) {
+                try {
+                    List<CatalogPartitionSpec> catalogPartitionSpecs =
+                            catalog.listPartitions(tablePath);
+                    for (CatalogPartitionSpec partitionSpec : catalogPartitionSpecs) {
+                        partitionList.add(partitionSpec.getPartitionSpec());
+                    }
+                } catch (TableNotExistException | TableNotPartitionedException e) {
+                    throw new TableException("Table not exists!", e);
+                }
+            } else {
+                partitionList = partitionPushDownSpec.getPartitions();
+            }
+
+            Optional<TableStats> optionalTableStats =
+                    getPartitionStats(
+                            catalog,
+                            table.contextResolvedTable().getIdentifier().toObjectPath(),
+                            partitionList);
+            return optionalTableStats.orElse(TableStats.UNKNOWN);
         }
 
-        return newTableStat;
+        return TableStats.UNKNOWN;
     }
 
     private Optional<TableStats> getPartitionStats(
-            Catalog catalog, ObjectPath tablePath, Map<String, String> partition) {
+            Catalog catalog, ObjectPath tablePath, List<Map<String, String>> partition) {
         try {
-            CatalogPartitionSpec spec = new CatalogPartitionSpec(partition);
-            CatalogTableStatistics partitionStat = catalog.getPartitionStatistics(tablePath, spec);
-            CatalogColumnStatistics partitionColStat =
-                    catalog.getPartitionColumnStatistics(tablePath, spec);
-            TableStats stats =
-                    CatalogTableStatisticsConverter.convertToTableStats(
-                            partitionStat, partitionColStat);
-            return Optional.of(stats);
+
+            final List<CatalogPartitionSpec> partitionSpecs =
+                    partition.stream().map(CatalogPartitionSpec::new).collect(Collectors.toList());
+
+            return Optional.of(
+                    convertToAccumulatedTableStates(
+                            catalog.bulkGetPartitionStatistics(tablePath, partitionSpecs),
+                            catalog.bulkGetPartitionColumnStatistics(tablePath, partitionSpecs),
+                            getPartitionKeys(partitionSpecs)));
         } catch (PartitionNotExistException e) {
             return Optional.empty();
         }
+    }
+
+    private static Set<String> getPartitionKeys(List<CatalogPartitionSpec> catalogPartitionSpecs) {
+        Set<String> partitionKeys = new HashSet<>();
+        for (CatalogPartitionSpec catalogPartitionSpec : catalogPartitionSpecs) {
+            Map<String, String> partitionSpec = catalogPartitionSpec.getPartitionSpec();
+            partitionKeys.addAll(partitionSpec.keySet());
+        }
+        return partitionKeys;
     }
 
     @SuppressWarnings({"unchecked", "raw"})

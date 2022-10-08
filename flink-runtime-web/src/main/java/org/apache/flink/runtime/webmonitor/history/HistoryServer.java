@@ -39,6 +39,7 @@ import org.apache.flink.runtime.security.SecurityConfiguration;
 import org.apache.flink.runtime.security.SecurityUtils;
 import org.apache.flink.runtime.util.EnvironmentInformation;
 import org.apache.flink.runtime.util.Runnables;
+import org.apache.flink.runtime.webmonitor.utils.LogUrlUtil;
 import org.apache.flink.runtime.webmonitor.utils.WebFrontendBootstrap;
 import org.apache.flink.util.ExceptionUtils;
 import org.apache.flink.util.ExecutorUtils;
@@ -47,8 +48,8 @@ import org.apache.flink.util.FileUtils;
 import org.apache.flink.util.FlinkException;
 import org.apache.flink.util.Preconditions;
 import org.apache.flink.util.ShutdownHookUtil;
-import org.apache.flink.util.StringUtils;
 import org.apache.flink.util.concurrent.ExecutorThreadFactory;
+import org.apache.flink.util.jackson.JacksonMapperFactory;
 
 import org.apache.flink.shaded.jackson2.com.fasterxml.jackson.databind.ObjectMapper;
 
@@ -100,7 +101,7 @@ import java.util.function.Consumer;
 public class HistoryServer {
 
     private static final Logger LOG = LoggerFactory.getLogger(HistoryServer.class);
-    private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
+    private static final ObjectMapper OBJECT_MAPPER = JacksonMapperFactory.createObjectMapper();
 
     private final Configuration config;
 
@@ -291,23 +292,24 @@ public class HistoryServer {
 
             Router router = new Router();
 
-            final String jobManagerPattern =
-                    config.get(HistoryServerOptions.HISTORY_SERVER_JOBMANAGER_LOG_URL_PATTERN);
-            if (!StringUtils.isNullOrWhitespaceOnly(jobManagerPattern)) {
-                router.addGet(
-                        JobManagerLogUrlHeaders.getInstance().getTargetRestEndpointURL(),
-                        new GeneratedLogUrlHandler(
-                                CompletableFuture.completedFuture(jobManagerPattern)));
-            }
-
-            final String taskManagerPattern =
-                    config.get(HistoryServerOptions.HISTORY_SERVER_TASKMANAGER_LOG_URL_PATTERN);
-            if (!StringUtils.isNullOrWhitespaceOnly(taskManagerPattern)) {
-                router.addGet(
-                        TaskManagerLogUrlHeaders.getInstance().getTargetRestEndpointURL(),
-                        new GeneratedLogUrlHandler(
-                                CompletableFuture.completedFuture(taskManagerPattern)));
-            }
+            LogUrlUtil.getValidLogUrlPattern(
+                            config, HistoryServerOptions.HISTORY_SERVER_JOBMANAGER_LOG_URL_PATTERN)
+                    .ifPresent(
+                            pattern ->
+                                    router.addGet(
+                                            JobManagerLogUrlHeaders.getInstance()
+                                                    .getTargetRestEndpointURL(),
+                                            new GeneratedLogUrlHandler(
+                                                    CompletableFuture.completedFuture(pattern))));
+            LogUrlUtil.getValidLogUrlPattern(
+                            config, HistoryServerOptions.HISTORY_SERVER_TASKMANAGER_LOG_URL_PATTERN)
+                    .ifPresent(
+                            pattern ->
+                                    router.addGet(
+                                            TaskManagerLogUrlHeaders.getInstance()
+                                                    .getTargetRestEndpointURL(),
+                                            new GeneratedLogUrlHandler(
+                                                    CompletableFuture.completedFuture(pattern))));
 
             router.addGet("/:*", new HistoryServerStaticFileServerHandler(webDir));
 

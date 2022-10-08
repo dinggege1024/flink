@@ -92,7 +92,13 @@ public class MiniClusterResource extends ExternalResource {
         return restClusterClientConfig;
     }
 
+    /** @deprecated use {@link #getRestAddress()} instead */
+    @Deprecated
     public URI getRestAddres() {
+        return getRestAddress();
+    }
+
+    public URI getRestAddress() {
         return miniCluster.getRestAddress().join();
     }
 

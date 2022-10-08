@@ -173,7 +173,7 @@ Flink 的设计力求使最大并行度的值达到很高的效率，即使执�
 
 ## 压缩
 
-Flink 为所有 checkpoints 和 savepoints 提供可选的压缩（默认：关闭）。 目前，压缩总是使用 [snappy 压缩算法（版本 1.1.4）]（https://github.com/xerial/snappy-java），
+Flink 为所有 checkpoints 和 savepoints 提供可选的压缩（默认：关闭）。 目前，压缩总是使用 [snappy 压缩算法（版本 1.1.4）](https://github.com/xerial/snappy-java),
 但我们计划在未来支持自定义压缩算法。 压缩作用于 keyed state 下 key-groups 的粒度，即每个 key-groups 可以单独解压缩，这对于重新缩放很重要。
 
 可以通过 `ExecutionConfig` 开启压缩：
@@ -241,9 +241,9 @@ Task 本地恢复 *默认禁用*，可以通过 Flink 的 CheckpointingOptions.L
 
 以下 state backends 可以支持 task 本地恢复。
 
-- FsStateBackend: keyed state 支持 task 本地恢复。 该实现会将状态复制到本地文件。 这会引入额外的写入成本并占用本地磁盘空间。 将来，我们可能还会提供一种将 task 本地状态保存在内存中的实现。
+- **HashMapStateBackend**: keyed state 支持 task 本地恢复。 该实现会将状态复制到本地文件。 这会引入额外的写入成本并占用本地磁盘空间。 将来，我们可能还会提供一种将 task 本地状态保存在内存中的实现。
 
-- RocksDBStateBackend: 支持 keyed state 的 task 本地恢复。对于*全量 checkpoints*，状态被复制到本地文件。这会引入额外的写入成本并占用本地磁盘空间。对于*增量快照*，本地状态基于 RocksDB 的原生 checkpointing 机制。
+- **EmbeddedRocksDBStateBackend**: 支持 keyed state 的 task 本地恢复。对于*全量 checkpoints*，状态被复制到本地文件。这会引入额外的写入成本并占用本地磁盘空间。对于*增量快照*，本地状态基于 RocksDB 的原生 checkpointing 机制。
   这种机制也被用作创建主副本的第一步，这意味着在这种情况下，创建次要副本不会引入额外的成本。我们只是保留本地 checkpoint 目录，
   而不是在上传到分布式存储后将其删除。这个本地副本可以与 RocksDB 的工作目录共享现有文件（通过硬链接），因此对于现有文件，增量快照的 task 本地恢复也不会消耗额外的磁盘空间。
   使用硬链接还意味着 RocksDB 目录必须与所有可用于存储本地状态和本地恢复目录位于同一节点上，否则建立硬链接可能会失败（参见 FLINK-10954）。

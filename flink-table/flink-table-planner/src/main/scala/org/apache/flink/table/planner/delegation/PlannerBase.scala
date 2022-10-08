@@ -26,7 +26,7 @@ import org.apache.flink.table.api.config.ExecutionConfigOptions
 import org.apache.flink.table.catalog._
 import org.apache.flink.table.catalog.ManagedTableListener.isManagedTable
 import org.apache.flink.table.connector.sink.DynamicTableSink
-import org.apache.flink.table.delegation.{Executor, Parser, Planner}
+import org.apache.flink.table.delegation.{Executor, ExtendedOperationExecutor, Parser, Planner}
 import org.apache.flink.table.factories.{DynamicTableSinkFactory, FactoryUtil, TableFactoryUtil}
 import org.apache.flink.table.module.{Module, ModuleManager}
 import org.apache.flink.table.operations._
@@ -36,7 +36,7 @@ import org.apache.flink.table.planner.calcite._
 import org.apache.flink.table.planner.catalog.CatalogManagerCalciteSchema
 import org.apache.flink.table.planner.connectors.DynamicSinkUtils
 import org.apache.flink.table.planner.connectors.DynamicSinkUtils.validateSchemaAndApplyImplicitCast
-import org.apache.flink.table.planner.delegation.ParserFactory.DefaultParserContext
+import org.apache.flink.table.planner.delegation.DialectFactory.DefaultParserContext
 import org.apache.flink.table.planner.expressions.PlannerTypeInferenceUtilImpl
 import org.apache.flink.table.planner.hint.FlinkHints
 import org.apache.flink.table.planner.operations.PlannerQueryOperation
@@ -46,11 +46,9 @@ import org.apache.flink.table.planner.plan.nodes.exec.processor.{ExecNodeGraphPr
 import org.apache.flink.table.planner.plan.nodes.exec.serde.SerdeContext
 import org.apache.flink.table.planner.plan.nodes.physical.FlinkPhysicalRel
 import org.apache.flink.table.planner.plan.optimize.Optimizer
-import org.apache.flink.table.planner.plan.reuse.SubplanReuser
-import org.apache.flink.table.planner.plan.utils.SameRelObjectShuttle
 import org.apache.flink.table.planner.sinks.DataStreamTableSink
 import org.apache.flink.table.planner.sinks.TableSinkUtils.{inferSinkPhysicalSchema, validateLogicalPhysicalTypesCompatible, validateTableSink}
-import org.apache.flink.table.planner.utils.InternalConfigOptions.{TABLE_QUERY_START_EPOCH_TIME, TABLE_QUERY_START_LOCAL_TIME}
+import org.apache.flink.table.planner.utils.InternalConfigOptions.{TABLE_QUERY_CURRENT_DATABASE, TABLE_QUERY_START_EPOCH_TIME, TABLE_QUERY_START_LOCAL_TIME}
 import org.apache.flink.table.planner.utils.JavaScalaConversionUtil.{toJava, toScala}
 import org.apache.flink.table.planner.utils.TableConfigUtils
 import org.apache.flink.table.runtime.generated.CompileUtils
@@ -63,7 +61,6 @@ import org.apache.calcite.plan.{RelTrait, RelTraitDef}
 import org.apache.calcite.rel.RelNode
 import org.apache.calcite.rel.hint.RelHint
 import org.apache.calcite.rel.logical.LogicalTableModify
-import org.apache.calcite.tools.FrameworkConfig
 
 import java.lang.{Long => JLong}
 import java.util
@@ -103,8 +100,13 @@ abstract class PlannerBase(
   // temporary utility until we don't use planner expressions anymore
   functionCatalog.setPlannerTypeInferenceUtil(PlannerTypeInferenceUtilImpl.INSTANCE)
 
+  private var dialectFactory: DialectFactory = _
   private var parser: Parser = _
+  private var extendedOperationExecutor: ExtendedOperationExecutor = _
   private var currentDialect: SqlDialect = getTableConfig.getSqlDialect
+  // the transformations generated in translateToPlan method, they are not connected
+  // with sink transformations but also are needed in the final graph.
+  private[flink] val extraTransformations = new util.ArrayList[Transformation[_]]()
 
   @VisibleForTesting
   private[flink] val plannerContext: PlannerContext =
@@ -150,23 +152,36 @@ abstract class PlannerBase(
     executor.asInstanceOf[DefaultExecutor].getExecutionEnvironment
   }
 
-  def createNewParser: Parser = {
-    val factoryIdentifier = getTableConfig.getSqlDialect.name().toLowerCase
-    val parserFactory = FactoryUtil.discoverFactory(
-      getClass.getClassLoader,
-      classOf[ParserFactory],
-      factoryIdentifier)
-
-    val context = new DefaultParserContext(catalogManager, plannerContext)
-    parserFactory.create(context)
+  def getDialectFactory: DialectFactory = {
+    if (dialectFactory == null || getTableConfig.getSqlDialect != currentDialect) {
+      val factoryIdentifier = getTableConfig.getSqlDialect.name().toLowerCase
+      dialectFactory = FactoryUtil.discoverFactory(
+        getClass.getClassLoader,
+        classOf[DialectFactory],
+        factoryIdentifier)
+      currentDialect = getTableConfig.getSqlDialect
+      parser = null
+      extendedOperationExecutor = null
+    }
+    dialectFactory
   }
 
   override def getParser: Parser = {
     if (parser == null || getTableConfig.getSqlDialect != currentDialect) {
-      parser = createNewParser
-      currentDialect = getTableConfig.getSqlDialect
+      dialectFactory = getDialectFactory
+      parser =
+        dialectFactory.create(new DefaultParserContext(catalogManager, plannerContext, executor))
     }
     parser
+  }
+
+  override def getExtendedOperationExecutor: ExtendedOperationExecutor = {
+    if (extendedOperationExecutor == null || getTableConfig.getSqlDialect != currentDialect) {
+      dialectFactory = getDialectFactory
+      extendedOperationExecutor = dialectFactory.createExtendedOperationExecutor(
+        new DefaultParserContext(catalogManager, plannerContext, executor))
+    }
+    extendedOperationExecutor
   }
 
   override def translate(
@@ -178,7 +193,7 @@ abstract class PlannerBase(
 
     val relNodes = modifyOperations.map(translateToRel)
     val optimizedRelNodes = optimize(relNodes)
-    val execGraph = translateToExecNodeGraph(optimizedRelNodes)
+    val execGraph = translateToExecNodeGraph(optimizedRelNodes, isCompiled = false)
     val transformations = translateToPlan(execGraph)
     afterTranslation()
     transformations
@@ -314,7 +329,9 @@ abstract class PlannerBase(
    * transforms the graph based on the given processors.
    */
   @VisibleForTesting
-  private[flink] def translateToExecNodeGraph(optimizedRelNodes: Seq[RelNode]): ExecNodeGraph = {
+  private[flink] def translateToExecNodeGraph(
+      optimizedRelNodes: Seq[RelNode],
+      isCompiled: Boolean): ExecNodeGraph = {
     val nonPhysicalRel = optimizedRelNodes.filterNot(_.isInstanceOf[FlinkPhysicalRel])
     if (nonPhysicalRel.nonEmpty) {
       throw new TableException(
@@ -323,15 +340,11 @@ abstract class PlannerBase(
     }
 
     require(optimizedRelNodes.forall(_.isInstanceOf[FlinkPhysicalRel]))
-    // Rewrite same rel object to different rel objects
-    // in order to get the correct dag (dag reuse is based on object not digest)
-    val shuttle = new SameRelObjectShuttle()
-    val relsWithoutSameObj = optimizedRelNodes.map(_.accept(shuttle))
-    // reuse subplan
-    val reusedPlan = SubplanReuser.reuseDuplicatedSubplan(relsWithoutSameObj, tableConfig)
+
     // convert FlinkPhysicalRel DAG to ExecNodeGraph
     val generator = new ExecNodeGraphGenerator()
-    val execGraph = generator.generate(reusedPlan.map(_.asInstanceOf[FlinkPhysicalRel]))
+    val execGraph =
+      generator.generate(optimizedRelNodes.map(_.asInstanceOf[FlinkPhysicalRel]), isCompiled)
 
     // process the graph
     val context = new ProcessorContext(this)
@@ -350,6 +363,12 @@ abstract class PlannerBase(
    *   The [[Transformation]] DAG that corresponds to the node DAG.
    */
   protected def translateToPlan(execGraph: ExecNodeGraph): util.List[Transformation[_]]
+
+  def addExtraTransformation(transformation: Transformation[_]): Unit = {
+    if (!extraTransformations.contains(transformation)) {
+      extraTransformations.add(transformation)
+    }
+  }
 
   private def getTableSink(
       contextResolvedTable: ContextResolvedTable,
@@ -450,8 +469,11 @@ abstract class PlannerBase(
       TimeZone.getTimeZone(TableConfigUtils.getLocalTimeZone(tableConfig)).getOffset(epochTime)
     tableConfig.set(TABLE_QUERY_START_LOCAL_TIME, localTime)
 
+    val currentDatabase = catalogManager.getCurrentDatabase
+    tableConfig.set(TABLE_QUERY_CURRENT_DATABASE, currentDatabase)
+
     // We pass only the configuration to avoid reconfiguration with the rootConfiguration
-    getExecEnv.configure(tableConfig.getConfiguration, Thread.currentThread().getContextClassLoader)
+    getExecEnv.configure(tableConfig.getConfiguration, classLoader)
 
     // Use config parallelism to override env parallelism.
     val defaultParallelism =
@@ -466,9 +488,11 @@ abstract class PlannerBase(
     val configuration = tableConfig.getConfiguration
     configuration.removeConfig(TABLE_QUERY_START_EPOCH_TIME)
     configuration.removeConfig(TABLE_QUERY_START_LOCAL_TIME)
+    configuration.removeConfig(TABLE_QUERY_CURRENT_DATABASE)
 
     // Clean caches that might have filled up during optimization
     CompileUtils.cleanUp()
+    extraTransformations.clear()
   }
 
   /** Returns all the graphs required to execute EXPLAIN */
@@ -501,8 +525,7 @@ abstract class PlannerBase(
       case o => throw new TableException(s"Unsupported operation: ${o.getClass.getCanonicalName}")
     }
     val optimizedRelNodes = optimize(sinkRelNodes)
-    val execGraph = translateToExecNodeGraph(optimizedRelNodes)
-
+    val execGraph = translateToExecNodeGraph(optimizedRelNodes, isCompiled = false)
     val transformations = translateToPlan(execGraph)
     afterTranslation()
 

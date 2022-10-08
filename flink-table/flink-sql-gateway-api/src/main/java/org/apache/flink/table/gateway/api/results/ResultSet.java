@@ -19,11 +19,13 @@
 package org.apache.flink.table.gateway.api.results;
 
 import org.apache.flink.annotation.PublicEvolving;
+import org.apache.flink.table.api.TableResult;
 import org.apache.flink.table.catalog.ResolvedSchema;
 import org.apache.flink.table.data.RowData;
 
 import javax.annotation.Nullable;
 
+import java.io.Serializable;
 import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
@@ -31,7 +33,13 @@ import java.util.stream.Collectors;
 
 /** The collection of the results. */
 @PublicEvolving
-public class ResultSet {
+public class ResultSet implements Serializable {
+
+    private static final long serialVersionUID = 1L;
+
+    public static final String FIELD_NAME_COLUMN_INFOS = "columns";
+
+    public static final String FIELD_NAME_DATA = "data";
 
     private final ResultType resultType;
 
@@ -72,7 +80,23 @@ public class ResultSet {
         return nextToken;
     }
 
-    /** The schema of the data. */
+    /**
+     * The schema of the data.
+     *
+     * <p>The schema of the DDL, USE, EXPLAIN, SHOW and DESCRIBE align with the schema of the {@link
+     * TableResult#getResolvedSchema()}. The only differences is the schema of the `INSERT`
+     * statement.
+     *
+     * <p>The schema of INSERT:
+     *
+     * <pre>
+     * +-------------+-------------+----------+
+     * | column name | column type | comments |
+     * +-------------+-------------+----------+
+     * |   job id    |    string   |          |
+     * +- -----------+-------------+----------+
+     * </pre>
+     */
     public ResolvedSchema getResultSchema() {
         return resultSchema;
     }
@@ -118,6 +142,7 @@ public class ResultSet {
     }
 
     /** Describe the kind of the result. */
+    @PublicEvolving
     public enum ResultType {
         /** Indicate the result is not ready. */
         NOT_READY,

@@ -22,6 +22,7 @@ import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.api.common.JobID;
 import org.apache.flink.api.java.tuple.Tuple2;
 import org.apache.flink.core.execution.SavepointFormatType;
+import org.apache.flink.runtime.checkpoint.FinishedTaskStateProvider.PartialFinishingNotSupportedByStateException;
 import org.apache.flink.runtime.checkpoint.hooks.MasterHooks;
 import org.apache.flink.runtime.executiongraph.Execution;
 import org.apache.flink.runtime.executiongraph.ExecutionAttemptID;
@@ -476,12 +477,17 @@ public class CheckpointCoordinator {
 
         checkNotNull(checkpointProperties);
 
+        return triggerCheckpointFromCheckpointThread(checkpointProperties, targetLocation, false);
+    }
+
+    private CompletableFuture<CompletedCheckpoint> triggerCheckpointFromCheckpointThread(
+            CheckpointProperties checkpointProperties, String targetLocation, boolean isPeriodic) {
         // TODO, call triggerCheckpoint directly after removing timer thread
         // for now, execute the trigger in timer thread to avoid competition
         final CompletableFuture<CompletedCheckpoint> resultFuture = new CompletableFuture<>();
         timer.execute(
                 () ->
-                        triggerCheckpoint(checkpointProperties, targetLocation, false)
+                        triggerCheckpoint(checkpointProperties, targetLocation, isPeriodic)
                                 .whenComplete(
                                         (completedCheckpoint, throwable) -> {
                                             if (throwable == null) {
@@ -498,16 +504,15 @@ public class CheckpointCoordinator {
      * The return value is a future. It completes when the checkpoint triggered finishes or an error
      * occurred.
      *
-     * @param isPeriodic Flag indicating whether this triggered checkpoint is periodic. If this flag
-     *     is true, but the periodic scheduler is disabled, the checkpoint will be declined.
+     * @param isPeriodic Flag indicating whether this triggered checkpoint is periodic.
      * @return a future to the completed checkpoint.
      */
     public CompletableFuture<CompletedCheckpoint> triggerCheckpoint(boolean isPeriodic) {
-        return triggerCheckpoint(checkpointProperties, null, isPeriodic);
+        return triggerCheckpointFromCheckpointThread(checkpointProperties, null, isPeriodic);
     }
 
     @VisibleForTesting
-    public CompletableFuture<CompletedCheckpoint> triggerCheckpoint(
+    CompletableFuture<CompletedCheckpoint> triggerCheckpoint(
             CheckpointProperties props,
             @Nullable String externalSavepointLocation,
             boolean isPeriodic) {
@@ -713,8 +718,6 @@ public class CheckpointCoordinator {
                                 return null;
                             });
 
-            coordinatorsToCheckpoint.forEach(
-                    (ctx) -> ctx.afterSourceBarrierInjection(checkpoint.getCheckpointID()));
             // It is possible that the tasks has finished
             // checkpointing at this point.
             // So we need to complete this pending checkpoint.
@@ -976,8 +979,10 @@ public class CheckpointCoordinator {
     private Optional<CheckpointTriggerRequest> chooseRequestToExecute(
             CheckpointTriggerRequest request) {
         synchronized (lock) {
-            return requestDecider.chooseRequestToExecute(
-                    request, isTriggering, lastCheckpointCompletionRelativeTime);
+            Optional<CheckpointTriggerRequest> checkpointTriggerRequest =
+                    requestDecider.chooseRequestToExecute(
+                            request, isTriggering, lastCheckpointCompletionRelativeTime);
+            return checkpointTriggerRequest;
         }
     }
 
@@ -1361,18 +1366,21 @@ public class CheckpointCoordinator {
         } catch (Exception e1) {
             // abort the current pending checkpoint if we fails to finalize the pending
             // checkpoint.
+            final CheckpointFailureReason failureReason =
+                    e1 instanceof PartialFinishingNotSupportedByStateException
+                            ? CheckpointFailureReason.CHECKPOINT_DECLINED_TASK_CLOSING
+                            : CheckpointFailureReason.FINALIZE_CHECKPOINT_FAILURE;
+
             if (!pendingCheckpoint.isDisposed()) {
                 abortPendingCheckpoint(
-                        pendingCheckpoint,
-                        new CheckpointException(
-                                CheckpointFailureReason.FINALIZE_CHECKPOINT_FAILURE, e1));
+                        pendingCheckpoint, new CheckpointException(failureReason, e1));
             }
 
             throw new CheckpointException(
                     "Could not finalize the pending checkpoint "
                             + pendingCheckpoint.getCheckpointID()
                             + '.',
-                    CheckpointFailureReason.FINALIZE_CHECKPOINT_FAILURE,
+                    failureReason,
                     e1);
         }
     }
@@ -1793,8 +1801,7 @@ public class CheckpointCoordinator {
                         checkpointLocation,
                         userClassLoader,
                         allowNonRestored,
-                        checkpointProperties,
-                        restoreSettings.getRestoreMode());
+                        checkpointProperties);
 
         // register shared state - even before adding the checkpoint to the store
         // because the latter might trigger subsumption so the ref counts must be up-to-date
@@ -2026,7 +2033,7 @@ public class CheckpointCoordinator {
         @Override
         public void run() {
             try {
-                triggerCheckpoint(true);
+                triggerCheckpoint(checkpointProperties, null, true);
             } catch (Exception e) {
                 LOG.error("Exception while triggering checkpoint for job {}.", job, e);
             }

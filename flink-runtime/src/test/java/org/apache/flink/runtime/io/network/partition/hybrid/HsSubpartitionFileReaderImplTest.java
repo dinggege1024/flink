@@ -23,6 +23,9 @@ import org.apache.flink.core.memory.MemorySegmentFactory;
 import org.apache.flink.core.testutils.CheckedThread;
 import org.apache.flink.core.testutils.OneShotLatch;
 import org.apache.flink.runtime.io.network.buffer.Buffer;
+import org.apache.flink.runtime.io.network.buffer.Buffer.DataType;
+import org.apache.flink.runtime.io.network.buffer.BufferCompressor;
+import org.apache.flink.runtime.io.network.buffer.BufferDecompressor;
 import org.apache.flink.runtime.io.network.buffer.FreeingBufferRecycler;
 import org.apache.flink.runtime.io.network.buffer.NetworkBuffer;
 import org.apache.flink.runtime.io.network.partition.BufferReaderWriterUtil;
@@ -36,6 +39,8 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
@@ -108,15 +113,17 @@ class HsSubpartitionFileReaderImplTest {
         writeDataToFile(1, 2, 25, 1);
 
         Queue<MemorySegment> memorySegments = createsMemorySegments(6);
-
+        fileReader1.prepareForScheduling();
         fileReader1.readBuffers(memorySegments, FreeingBufferRecycler.INSTANCE);
         assertThat(memorySegments).hasSize(4);
         checkData(fileReader1, 10, 11);
 
+        fileReader2.prepareForScheduling();
         fileReader2.readBuffers(memorySegments, FreeingBufferRecycler.INSTANCE);
         assertThat(memorySegments).hasSize(2);
         checkData(fileReader2, 20, 21);
 
+        fileReader1.prepareForScheduling();
         fileReader1.readBuffers(memorySegments, FreeingBufferRecycler.INSTANCE);
         assertThat(memorySegments).hasSize(1);
         checkData(fileReader1, 15);
@@ -124,6 +131,27 @@ class HsSubpartitionFileReaderImplTest {
         fileReader2.readBuffers(memorySegments, FreeingBufferRecycler.INSTANCE);
         assertThat(memorySegments).isEmpty();
         checkData(fileReader2, 25);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"LZ4", "LZO", "ZSTD"})
+    void testReadBufferCompressed(String compressionFactoryName) throws Exception {
+        BufferCompressor bufferCompressor =
+                new BufferCompressor(bufferSize, compressionFactoryName);
+        BufferDecompressor bufferDecompressor =
+                new BufferDecompressor(bufferSize, compressionFactoryName);
+
+        diskIndex = new HsFileDataIndexImpl(1);
+        TestingSubpartitionViewInternalOperation viewNotifier =
+                new TestingSubpartitionViewInternalOperation();
+        HsSubpartitionFileReaderImpl fileReader1 = createSubpartitionFileReader(0, viewNotifier);
+
+        writeDataToFile(0, 0, 1, 3, bufferCompressor);
+
+        Queue<MemorySegment> memorySegments = createsMemorySegments(3);
+        fileReader1.prepareForScheduling();
+        fileReader1.readBuffers(memorySegments, FreeingBufferRecycler.INSTANCE);
+        checkData(fileReader1, bufferDecompressor, 1, 2, 3);
     }
 
     @Test
@@ -150,7 +178,7 @@ class HsSubpartitionFileReaderImplTest {
 
         subpartitionOperation.advanceConsumptionProgress();
         subpartitionOperation.advanceConsumptionProgress();
-        assertThat(subpartitionOperation.getConsumingOffset()).isEqualTo(1);
+        assertThat(subpartitionOperation.getConsumingOffset(true)).isEqualTo(1);
         // update consumptionProgress
         subpartitionFileReader.prepareForScheduling();
         // read buffer, expected buffer with index: 2
@@ -360,20 +388,140 @@ class HsSubpartitionFileReaderImplTest {
         assertThat(fileReader1).isGreaterThan(fileReader2);
     }
 
-    private static void checkData(HsSubpartitionFileReaderImpl fileReader, int... expectedData) {
+    @Test
+    void testConsumeBuffer() throws Throwable {
+        TestingSubpartitionViewInternalOperation viewNotifier =
+                new TestingSubpartitionViewInternalOperation();
+        HsSubpartitionFileReaderImpl subpartitionFileReader =
+                createSubpartitionFileReader(0, viewNotifier);
+
+        // if no preload data in file reader, return Optional.empty.
+        assertThat(subpartitionFileReader.consumeBuffer(0)).isNotPresent();
+
+        // buffers in file: (0-0, 0-1)
+        writeDataToFile(0, 0, 0, 2);
+
+        Queue<MemorySegment> memorySegments = createsMemorySegments(2);
+        subpartitionFileReader.prepareForScheduling();
+        // trigger reading, add buffer to queue.
+        subpartitionFileReader.readBuffers(memorySegments, (ignore) -> {});
+
+        // if nextBufferToConsume is not equal to peek elements index, return Optional.empty.
+        assertThat(subpartitionFileReader.consumeBuffer(10)).isNotPresent();
+
+        assertThat(subpartitionFileReader.consumeBuffer(0))
+                .hasValueSatisfying(
+                        (bufferAndBacklog -> {
+                            assertThat(bufferAndBacklog.getNextDataType())
+                                    .isEqualTo(DataType.EVENT_BUFFER);
+                            assertThat(bufferAndBacklog.getSequenceNumber()).isEqualTo(0);
+                            // first buffer's data is 0.
+                            assertThat(
+                                            bufferAndBacklog
+                                                    .buffer()
+                                                    .getNioBufferReadable()
+                                                    .order(ByteOrder.nativeOrder())
+                                                    .getInt())
+                                    .isEqualTo(0);
+                        }));
+    }
+
+    @Test
+    void testPeekNextToConsumeDataTypeOrConsumeBufferThrowException() {
+        TestingSubpartitionViewInternalOperation viewNotifier =
+                new TestingSubpartitionViewInternalOperation();
+        HsSubpartitionFileReaderImpl subpartitionFileReader =
+                createSubpartitionFileReader(0, viewNotifier);
+
+        subpartitionFileReader.fail(new RuntimeException("expected exception."));
+
+        assertThatThrownBy(() -> subpartitionFileReader.peekNextToConsumeDataType(0))
+                .isInstanceOf(RuntimeException.class)
+                .hasMessageContaining("expected exception.");
+
+        assertThatThrownBy(() -> subpartitionFileReader.consumeBuffer(0))
+                .isInstanceOf(RuntimeException.class)
+                .hasMessageContaining("expected exception.");
+    }
+
+    @Test
+    void testPeekNextToConsumeDataType() throws Throwable {
+        TestingSubpartitionViewInternalOperation viewNotifier =
+                new TestingSubpartitionViewInternalOperation();
+        HsSubpartitionFileReaderImpl subpartitionFileReader =
+                createSubpartitionFileReader(0, viewNotifier);
+
+        // if no preload data in file reader, return DataType.NONE.
+        assertThat(subpartitionFileReader.peekNextToConsumeDataType(0)).isEqualTo(DataType.NONE);
+
+        // buffers in file: (0-0, 0-1)
+        writeDataToFile(0, 0, 2);
+
+        Queue<MemorySegment> memorySegments = createsMemorySegments(2);
+        subpartitionFileReader.prepareForScheduling();
+        // trigger reading, add buffer to queue.
+        subpartitionFileReader.readBuffers(memorySegments, (ignore) -> {});
+
+        // if nextBufferToConsume is not equal to peek elements index, return DataType.NONE.
+        assertThat(subpartitionFileReader.peekNextToConsumeDataType(10)).isEqualTo(DataType.NONE);
+
+        // if nextBufferToConsume is equal to peek elements index, return the real DataType.
+        assertThat(subpartitionFileReader.peekNextToConsumeDataType(0))
+                .isEqualTo(DataType.DATA_BUFFER);
+    }
+
+    /**
+     * If subpartitionReader is registered more than once due to failover, the new reader should be
+     * able to read all the released data from disk, even if some data was read from memory before
+     * failover.
+     */
+    @Test
+    void testSubpartitionReaderRegisterMultipleTimes() throws Exception {
+        TestingSubpartitionViewInternalOperation viewNotifier =
+                new TestingSubpartitionViewInternalOperation();
+        HsSubpartitionFileReaderImpl subpartitionFileReader =
+                createSubpartitionFileReader(0, viewNotifier);
+        // mock the scenario that buffer 0 is already read form memory.
+        viewNotifier.advanceConsumptionProgress();
+        writeDataToFile(0, 0, 1, 3);
+        subpartitionFileReader.prepareForScheduling();
+        Queue<MemorySegment> memorySegments = createsMemorySegments(3);
+        subpartitionFileReader.readBuffers(memorySegments, (ignore) -> {});
+        assertThat(memorySegments).hasSize(1);
+        checkData(subpartitionFileReader, 2, 3);
+
+        // after failover, new view and subpartitionFileReader will be created.
+        viewNotifier = new TestingSubpartitionViewInternalOperation();
+        subpartitionFileReader = createSubpartitionFileReader(0, viewNotifier);
+        subpartitionFileReader.prepareForScheduling();
+        memorySegments = createsMemorySegments(3);
+        subpartitionFileReader.readBuffers(memorySegments, (ignore) -> {});
+        assertThat(memorySegments).isEmpty();
+        // buffer 0 can be read from disk correctly.
+        checkData(subpartitionFileReader, 1, 2, 3);
+    }
+
+    private static void checkData(
+            HsSubpartitionFileReaderImpl fileReader,
+            BufferDecompressor bufferDecompressor,
+            int... expectedData) {
         assertThat(fileReader.getLoadedBuffers()).hasSameSizeAs(expectedData);
         for (int data : expectedData) {
             BufferIndexOrError bufferIndexOrError = fileReader.getLoadedBuffers().poll();
             assertThat(bufferIndexOrError).isNotNull();
-            assertThat(bufferIndexOrError.getBuffer())
-                    .hasValueSatisfying(
-                            buffer ->
-                                    assertThat(
-                                                    buffer.getNioBufferReadable()
-                                                            .order(ByteOrder.nativeOrder())
-                                                            .getInt())
-                                            .isEqualTo(data));
+            assertThat(bufferIndexOrError.getBuffer()).isPresent();
+            Buffer buffer = bufferIndexOrError.getBuffer().get();
+            buffer =
+                    buffer.isCompressed() && bufferDecompressor != null
+                            ? bufferDecompressor.decompressToIntermediateBuffer(buffer)
+                            : buffer;
+            assertThat(buffer.getNioBufferReadable().order(ByteOrder.nativeOrder()).getInt())
+                    .isEqualTo(data);
         }
+    }
+
+    private static void checkData(HsSubpartitionFileReaderImpl fileReader, int... expectedData) {
+        checkData(fileReader, null, expectedData);
     }
 
     private HsSubpartitionFileReaderImpl createSubpartitionFileReader() {
@@ -383,7 +531,13 @@ class HsSubpartitionFileReaderImplTest {
     private HsSubpartitionFileReaderImpl createSubpartitionFileReader(
             int targetChannel, HsSubpartitionViewInternalOperations operations) {
         return new HsSubpartitionFileReaderImpl(
-                targetChannel, dataFileChannel, operations, diskIndex, MAX_BUFFERS_READ_AHEAD);
+                targetChannel,
+                dataFileChannel,
+                operations,
+                diskIndex,
+                MAX_BUFFERS_READ_AHEAD,
+                (ignore) -> {},
+                BufferReaderWriterUtil.allocatedHeaderBuffer());
     }
 
     private static FileChannel openFileChannel(Path path) throws IOException {
@@ -399,7 +553,11 @@ class HsSubpartitionFileReaderImplTest {
     }
 
     private void writeDataToFile(
-            int subpartitionId, int firstBufferIndex, int firstBufferData, int numBuffers)
+            int subpartitionId,
+            int firstBufferIndex,
+            int firstBufferData,
+            int numBuffers,
+            BufferCompressor bufferCompressor)
             throws Exception {
         List<SpilledBuffer> spilledBuffers = new ArrayList<>(numBuffers);
         ByteBuffer[] bufferWithHeaders = new ByteBuffer[2 * numBuffers];
@@ -416,11 +574,14 @@ class HsSubpartitionFileReaderImplTest {
             Buffer buffer =
                     new NetworkBuffer(
                             segment, FreeingBufferRecycler.INSTANCE, dataType, bufferSize);
+            if (bufferCompressor != null && buffer.isBuffer()) {
+                buffer = bufferCompressor.compressToOriginalBuffer(buffer);
+            }
             setBufferWithHeader(buffer, bufferWithHeaders, 2 * i);
             spilledBuffers.add(
                     new SpilledBuffer(
                             subpartitionId, firstBufferIndex + i, currentFileOffset + totalBytes));
-            totalBytes += bufferSize + BufferReaderWriterUtil.HEADER_LENGTH;
+            totalBytes += buffer.getSize() + BufferReaderWriterUtil.HEADER_LENGTH;
         }
 
         BufferReaderWriterUtil.writeBuffers(dataFileChannel, totalBytes, bufferWithHeaders);
@@ -430,7 +591,13 @@ class HsSubpartitionFileReaderImplTest {
         // mark all buffers status to release.
         spilledBuffers.forEach(
                 spilledBuffer ->
-                        diskIndex.markBufferReadable(subpartitionId, spilledBuffer.bufferIndex));
+                        diskIndex.markBufferReleased(subpartitionId, spilledBuffer.bufferIndex));
+    }
+
+    private void writeDataToFile(
+            int subpartitionId, int firstBufferIndex, int firstBufferData, int numBuffers)
+            throws Exception {
+        writeDataToFile(subpartitionId, firstBufferIndex, firstBufferData, numBuffers, null);
     }
 
     private void writeDataToFile(int subpartitionId, int firstBufferIndex, int numBuffers)

@@ -113,7 +113,7 @@ arithmetic:
     table: NUMERIC1 + NUMERIC2
     description: Returns NUMERIC1 plus NUMERIC2.
   - sql: numeric1 - numeric2
-    table: NUMERIC1 + NUMERIC2
+    table: NUMERIC1 - NUMERIC2
     description: Return NUMERIC1 minus NUMERIC2
   - sql: numeric1 * numberic2
     table: NUMERIC1 * NUMERIC2
@@ -364,10 +364,13 @@ string:
     table: STRING1.regexp(STRING2)
     description: Returns TRUE if any (possibly empty) substring of string1 matches the Java regular expression string2, otherwise FALSE. Returns NULL if any of arguments is NULL.
   - sql: REVERSE(string)
+    table: STRING.reverse()
     description: Returns the reversed string. Returns NULL if string is NULL.
   - sql: SPLIT_INDEX(string1, string2, integer1)
+    table: STRING1.splitIndex(STRING2, INTEGER1)
     description: Splits string1 by the delimiter string2, returns the integerth (zero-based) string of the split strings. Returns NULL if integer is negative. Returns NULL if any of arguments is NULL.
   - sql: STR_TO_MAP(string1[, string2, string3])
+    table: STRING1.strToMap([STRING2, STRING3])
     description: |
       Returns a map after splitting the string1 into key/value pairs using delimiters. string2 is the pair delimiter, default is ','. And string3 is the key-value delimiter, default is '='.
       Both pair delimiter and key-value delimiter are treated as regular expressions. So special characters (e.g. `<([{\^-=$!|]})?*+.>`) need to be properly escaped before using as a delimiter literally.
@@ -450,17 +453,17 @@ temporal:
     table: TEMPORAL.extract(TIMEINTERVALUNIT)
     description: Returns a long value extracted from the timeintervalunit part of temporal. E.g., EXTRACT(DAY FROM DATE '2006-06-05') returns 5.
   - sql: YEAR(date)
-    description: Returns the year from SQL date date. Equivalent to EXTRACT(YEAR FROM date). E.g., YEAR(DATE '1994-09-27') returns 1994.
+    description: Returns the year from SQL date. Equivalent to EXTRACT(YEAR FROM date). E.g., YEAR(DATE '1994-09-27') returns 1994.
   - sql: QUARTER(date)
-    description: Returns the quarter of a year (an integer between 1 and 4) from SQL date date. Equivalent to EXTRACT(QUARTER FROM date). E.g., QUARTER(DATE '1994-09-27') returns 3.
+    description: Returns the quarter of a year (an integer between 1 and 4) from SQL date. Equivalent to EXTRACT(QUARTER FROM date). E.g., QUARTER(DATE '1994-09-27') returns 3.
   - sql: MONTH(date)
-    description: Returns the month of a year (an integer between 1 and 12) from SQL date date. Equivalent to EXTRACT(MONTH FROM date). E.g., MONTH(DATE '1994-09-27') returns 9.
+    description: Returns the month of a year (an integer between 1 and 12) from SQL date. Equivalent to EXTRACT(MONTH FROM date). E.g., MONTH(DATE '1994-09-27') returns 9.
   - sql: WEEK(date)
-    description: Returns the week of a year (an integer between 1 and 53) from SQL date date. Equivalent to EXTRACT(WEEK FROM date). E.g., WEEK(DATE '1994-09-27') returns 39.
+    description: Returns the week of a year (an integer between 1 and 53) from SQL date. Equivalent to EXTRACT(WEEK FROM date). E.g., WEEK(DATE '1994-09-27') returns 39.
   - sql: DAYOFYEAR(date)
-    description:  Returns the day of a year (an integer between 1 and 366) from SQL date date. Equivalent to EXTRACT(DOY FROM date). E.g., DAYOFYEAR(DATE '1994-09-27') returns 270.
+    description:  Returns the day of a year (an integer between 1 and 366) from SQL date. Equivalent to EXTRACT(DOY FROM date). E.g., DAYOFYEAR(DATE '1994-09-27') returns 270.
   - sql: DAYOFMONTH
-    description: Returns the day of a month (an integer between 1 and 31) from SQL date date. Equivalent to EXTRACT(DAY FROM date). E.g., DAYOFWEEK(DATE '1994-09-27') returns 3.
+    description: Returns the day of a month (an integer between 1 and 31) from SQL date. Equivalent to EXTRACT(DAY FROM date). E.g., DAYOFMONTH(DATE '1994-09-27') returns 27.
   - sql: HOUR(timestamp)
     description: Returns the hour of a day (an integer between 0 and 23) from SQL timestamp timestamp. Equivalent to EXTRACT(HOUR FROM timestamp). E.g., MINUTE(TIMESTAMP '1994-09-27 13:14:15') returns 14.
   - sql: MINUTE(timestamp)
@@ -704,6 +707,11 @@ json:
       `NULL ON EMPTY` or `NULL ON ERROR`, respectively. The default value may be a literal or an
       expression. If the default value itself raises an error, it falls through to the error
       behavior for `ON EMPTY`, and raises an error for `ON ERROR`.
+      
+      For path contains special characters such as spaces, you can use `['property']` or `["property"]` 
+      to select the specified property in a parent object. Be sure to put single or double quotes around the property name.
+      When using JSON_VALUE in SQL, the path is a character parameter which is already single quoted, 
+      so you have to escape the single quotes around property name, such as `JSON_VALUE('{"a b": "true"}', '$.[''a b'']')`.
 
       ```
       -- "true"
@@ -723,6 +731,9 @@ json:
       -- 0.998D
       JSON_VALUE('{"a.b": [0.998,0.996]}','$.["a.b"][0]' 
           RETURNING DOUBLE)
+      
+      -- "right"
+      JSON_VALUE('{"contains blank": "right"}', 'strict $.[''contains blank'']' NULL ON EMPTY DEFAULT 'wrong' ON ERROR)
       ```
   - sql: JSON_QUERY(jsonValue, path [ { WITHOUT | WITH CONDITIONAL | WITH UNCONDITIONAL } [ ARRAY ] WRAPPER ] [ { NULL | EMPTY ARRAY | EMPTY OBJECT | ERROR } ON EMPTY ] [ { NULL | EMPTY ARRAY | EMPTY OBJECT | ERROR } ON ERROR ])
     table: STRING.jsonQuery(path [, JsonQueryWrapper [, JsonQueryOnEmptyOrError, JsonQueryOnEmptyOrError ] ])
@@ -1001,4 +1012,19 @@ aggregate:
     table: FIELD.lastValue
     description: Returns the last value in an ordered set of values.
   - sql: LISTAGG(expression [, separator])
+    table: FIELD.listagg
     description: Concatenates the values of string expressions and places separator values between them. The separator is not added at the end of string. The default value of separator is ','.
+  - sql: CUME_DIST()
+    description: Return the cumulative distribution of a value in a group of values. The result is the number of rows preceding or equal to the current row in the ordering of the partition divided by the number of rows in the window partition.
+  - sql: PERCENT_RANK()
+    description: Return the percentage ranking of a value in a group of values. The result is the rank value minus one, divided by the number of rows in the parition minus one. If the partition only contains one row, the function will return 0.
+  - sql: NTILE(n)
+    description: |
+      Divides the rows for each window partition into `n` buckets ranging from 1 to at most `n`.
+      If the number of rows in the window partition doesn't divide evenly into the number of buckets, then the remainder values are distributed one per bucket, starting with the first bucket.
+      For example, with 6 rows and 4 buckets, the bucket values would be as follows: 1 1 2 2 3 4
+
+catalog:
+  - sql: CURRENT_DATABASE()
+    table: currentDatabase()
+    description: Return the current database.

@@ -18,8 +18,11 @@
 
 package org.apache.flink.table.gateway.service.session;
 
+import org.apache.flink.configuration.Configuration;
+import org.apache.flink.table.gateway.api.endpoint.EndpointVersion;
 import org.apache.flink.table.gateway.api.session.SessionHandle;
 import org.apache.flink.table.gateway.service.context.SessionContext;
+import org.apache.flink.table.gateway.service.operation.OperationExecutor;
 import org.apache.flink.table.gateway.service.operation.OperationManager;
 
 import java.io.Closeable;
@@ -28,9 +31,6 @@ import java.util.Map;
 /**
  * Similar to HTTP Session, which could maintain user identity and store user-specific data during
  * multiple request/response interactions between a client and the gateway server.
- *
- * <p>TODO: make operation execution in sequence in
- * https://issues.apache.org/jira/browse/FLINK-28053
  */
 public class Session implements Closeable {
 
@@ -58,8 +58,20 @@ public class Session implements Closeable {
         return sessionContext.getConfigMap();
     }
 
+    public EndpointVersion getEndpointVersion() {
+        return sessionContext.getEndpointVersion();
+    }
+
     public OperationManager getOperationManager() {
         return sessionContext.getOperationManager();
+    }
+
+    public OperationExecutor createExecutor() {
+        return sessionContext.createOperationExecutor(new Configuration());
+    }
+
+    public OperationExecutor createExecutor(Configuration executionConfig) {
+        return sessionContext.createOperationExecutor(executionConfig);
     }
 
     @Override

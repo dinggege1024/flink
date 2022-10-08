@@ -26,7 +26,6 @@ import org.apache.flink.table.client.cli.utils.TestSqlStatement;
 import org.apache.flink.table.client.gateway.Executor;
 import org.apache.flink.table.client.gateway.context.DefaultContext;
 import org.apache.flink.table.client.gateway.local.LocalExecutor;
-import org.apache.flink.table.client.gateway.utils.UserDefinedFunctions;
 import org.apache.flink.table.planner.utils.TableTestUtil;
 import org.apache.flink.test.util.AbstractTestBase;
 import org.apache.flink.util.UserClassLoaderJarTestUtils;
@@ -67,13 +66,28 @@ import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
 
+import static org.apache.commons.lang3.StringUtils.repeat;
 import static org.apache.flink.configuration.JobManagerOptions.ADDRESS;
 import static org.apache.flink.configuration.RestOptions.PORT;
+import static org.apache.flink.table.utils.UserDefinedFunctions.GENERATED_LOWER_UDF_CLASS;
+import static org.apache.flink.table.utils.UserDefinedFunctions.GENERATED_LOWER_UDF_CODE;
+import static org.apache.flink.table.utils.UserDefinedFunctions.GENERATED_UPPER_UDF_CLASS;
+import static org.apache.flink.table.utils.UserDefinedFunctions.GENERATED_UPPER_UDF_CODE;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /** Test that runs every {@code xx.q} file in "resources/sql/" path as a test. */
 @RunWith(Parameterized.class)
 public class CliClientITCase extends AbstractTestBase {
+
+    private static final String HIVE_ADD_ONE_UDF_CLASS = "HiveAddOneFunc";
+    private static final String HIVE_ADD_ONE_UDF_CODE =
+            "public class "
+                    + HIVE_ADD_ONE_UDF_CLASS
+                    + " extends org.apache.hadoop.hive.ql.exec.UDF {\n"
+                    + " public int evaluate(int content) {\n"
+                    + "    return content + 1;\n"
+                    + " }"
+                    + "}\n";
 
     private static Path historyPath;
     private static Map<String, String> replaceVars;
@@ -99,17 +113,31 @@ public class CliClientITCase extends AbstractTestBase {
 
     @BeforeClass
     public static void setup() throws IOException {
+        Map<String, String> classNameCodes = new HashMap<>();
+        classNameCodes.put(
+                GENERATED_LOWER_UDF_CLASS,
+                String.format(GENERATED_LOWER_UDF_CODE, GENERATED_LOWER_UDF_CLASS));
+        classNameCodes.put(
+                GENERATED_UPPER_UDF_CLASS,
+                String.format(GENERATED_UPPER_UDF_CODE, GENERATED_UPPER_UDF_CLASS));
+        classNameCodes.put(HIVE_ADD_ONE_UDF_CLASS, HIVE_ADD_ONE_UDF_CODE);
+
         File udfJar =
                 UserClassLoaderJarTestUtils.createJarFile(
                         tempFolder.newFolder("test-jar"),
                         "test-classloader-udf.jar",
-                        UserDefinedFunctions.GENERATED_UDF_CLASS,
-                        UserDefinedFunctions.GENERATED_UDF_CODE);
+                        classNameCodes);
         URL udfDependency = udfJar.toURI().toURL();
+        String path = udfDependency.getPath();
+        // we need to pad the displayed "jars" tableau to have the same width of path string
+        // 4 for the "jars" characters, see `set.q` test file
+        int paddingLen = path.length() - 4;
         historyPath = tempFolder.newFile("history").toPath();
 
         replaceVars = new HashMap<>();
-        replaceVars.put("$VAR_UDF_JAR_PATH", udfDependency.getPath());
+        replaceVars.put("$VAR_UDF_JAR_PATH", path);
+        replaceVars.put("$VAR_UDF_JAR_PATH_DASH", repeat('-', paddingLen));
+        replaceVars.put("$VAR_UDF_JAR_PATH_SPACE", repeat(' ', paddingLen));
         replaceVars.put("$VAR_PIPELINE_JARS_URL", udfDependency.toString());
         replaceVars.put(
                 "$VAR_REST_PORT",

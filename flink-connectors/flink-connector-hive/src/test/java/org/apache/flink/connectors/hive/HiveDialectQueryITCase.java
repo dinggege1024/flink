@@ -23,12 +23,17 @@ import org.apache.flink.table.api.SqlDialect;
 import org.apache.flink.table.api.TableEnvironment;
 import org.apache.flink.table.catalog.hive.HiveCatalog;
 import org.apache.flink.table.catalog.hive.HiveTestUtils;
+import org.apache.flink.table.catalog.hive.client.HiveShim;
+import org.apache.flink.table.catalog.hive.client.HiveShimLoader;
+import org.apache.flink.table.functions.hive.conversion.HiveInspectors;
 import org.apache.flink.table.module.CoreModule;
 import org.apache.flink.table.module.hive.HiveModule;
 import org.apache.flink.table.planner.delegation.hive.HiveParserUtils;
 import org.apache.flink.types.Row;
 import org.apache.flink.util.CollectionUtil;
+import org.apache.flink.util.FileUtils;
 
+import org.apache.hadoop.hive.common.type.HiveDecimal;
 import org.apache.hadoop.hive.conf.HiveConf;
 import org.apache.hadoop.hive.ql.exec.UDFArgumentException;
 import org.apache.hadoop.hive.ql.metadata.HiveException;
@@ -37,6 +42,8 @@ import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspector;
 import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspectorFactory;
 import org.apache.hadoop.hive.serde2.objectinspector.StructObjectInspector;
 import org.apache.hadoop.hive.serde2.objectinspector.primitive.PrimitiveObjectInspectorFactory;
+import org.apache.hadoop.hive.serde2.objectinspector.primitive.TimestampObjectInspector;
+import org.apache.hadoop.hive.serde2.typeinfo.TypeInfoFactory;
 import org.junit.BeforeClass;
 import org.junit.ComparisonFailure;
 import org.junit.Test;
@@ -44,13 +51,19 @@ import org.junit.Test;
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileReader;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.sql.Timestamp;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.Objects;
 import java.util.stream.Collectors;
 
+import static org.apache.flink.table.planner.utils.TableTestUtil.readFromResource;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** Test hive query compatibility. */
 public class HiveDialectQueryITCase {
@@ -61,6 +74,7 @@ public class HiveDialectQueryITCase {
 
     private static HiveCatalog hiveCatalog;
     private static TableEnvironment tableEnv;
+    private static String warehouse;
 
     @BeforeClass
     public static void setup() throws Exception {
@@ -69,10 +83,11 @@ public class HiveDialectQueryITCase {
         hiveCatalog.getHiveConf().setVar(HiveConf.ConfVars.HIVE_QUOTEDID_SUPPORT, "none");
         hiveCatalog.open();
         tableEnv = getTableEnvWithHiveCatalog();
+        warehouse = hiveCatalog.getHiveConf().getVar(HiveConf.ConfVars.METASTOREWAREHOUSE);
 
         // create tables
         tableEnv.executeSql("create table foo (x int, y int)");
-        tableEnv.executeSql("create table bar(i int, s string)");
+        tableEnv.executeSql("create table bar(I int, s string)");
         tableEnv.executeSql("create table baz(ai array<int>, d double)");
         tableEnv.executeSql(
                 "create table employee(id int,name string,dep string,salary int,age int)");
@@ -80,6 +95,7 @@ public class HiveDialectQueryITCase {
         tableEnv.executeSql("create table destp (x int) partitioned by (p string, q string)");
         tableEnv.executeSql("alter table destp add partition (p='-1',q='-1')");
         tableEnv.executeSql("CREATE TABLE src (key STRING, value STRING)");
+        tableEnv.executeSql("CREATE TABLE t_sub_query (x int)");
         tableEnv.executeSql(
                 "CREATE TABLE srcpart (key STRING, `value` STRING) PARTITIONED BY (ds STRING, hr STRING)");
         tableEnv.executeSql("create table binary_t (a int, ab array<binary>)");
@@ -113,6 +129,10 @@ public class HiveDialectQueryITCase {
                 .addRow(new Object[] {"1", "val1"})
                 .addRow(new Object[] {"2", "val2"})
                 .addRow(new Object[] {"3", "val3"})
+                .commit();
+        HiveTestUtils.createTextTableInserter(hiveCatalog, "default", "t_sub_query")
+                .addRow(new Object[] {2})
+                .addRow(new Object[] {3})
                 .commit();
         HiveTestUtils.createTextTableInserter(hiveCatalog, "default", "employee")
                 .addRow(new Object[] {1, "A", "Management", 4500, 55})
@@ -159,7 +179,11 @@ public class HiveDialectQueryITCase {
                                 "select salary,sum(cnt) over (order by salary)/sum(cnt) over "
                                         + "(order by salary ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) from"
                                         + " (select salary,count(*) as cnt from employee group by salary) a",
-                                "select a, one from binary_t lateral view explode(ab) abs as one where a > 0"));
+                                "select a, one from binary_t lateral view explode(ab) abs as one where a > 0",
+                                "select /*+ mapjoin(dest) */ foo.x from foo join dest on foo.x = dest.x union"
+                                        + " all select /*+ mapjoin(dest) */ foo.x from foo join dest on foo.y = dest.y",
+                                "with cte as (select * from src) select * from cte",
+                                "select 1 / 0"));
         if (HiveVersionTestUtil.HIVE_230_OR_LATER) {
             toRun.add(
                     "select weekofyear(current_timestamp()), dayofweek(current_timestamp()) from src limit 1");
@@ -361,6 +385,466 @@ public class HiveDialectQueryITCase {
         }
     }
 
+    @Test
+    public void testCurrentDatabase() {
+        List<Row> result =
+                CollectionUtil.iteratorToList(
+                        tableEnv.executeSql("select current_database()").collect());
+        assertThat(result.toString()).isEqualTo("[+I[default]]");
+        tableEnv.executeSql("create database db1");
+        tableEnv.executeSql("use db1");
+        result =
+                CollectionUtil.iteratorToList(
+                        tableEnv.executeSql("select current_database()").collect());
+        assertThat(result.toString()).isEqualTo("[+I[db1]]");
+        // switch to default database for following test use default database
+        tableEnv.executeSql("use default");
+        tableEnv.executeSql("drop database db1");
+    }
+
+    @Test
+    public void testDistinctFrom() throws Exception {
+        try {
+            tableEnv.executeSql("create table test(x string, y string)");
+            tableEnv.executeSql(
+                            "insert into test values ('q', 'q'), ('q', 'w'), (NULL, 'q'), ('q', NULL), (NULL, NULL)")
+                    .await();
+            List<Row> result =
+                    CollectionUtil.iteratorToList(
+                            tableEnv.executeSql("select x <=> y, (x <=> y) = false from test")
+                                    .collect());
+            assertThat(result.toString())
+                    .isEqualTo(
+                            "[+I[true, false], +I[false, true], +I[false, true], +I[false, true], +I[true, false]]");
+        } finally {
+            tableEnv.executeSql("drop table test");
+        }
+    }
+
+    @Test
+    public void testTableSample() throws Exception {
+        tableEnv.executeSql("create table test_sample(a int)");
+        try {
+            tableEnv.executeSql("insert into test_sample values (2), (1), (3)").await();
+            List<Row> result =
+                    CollectionUtil.iteratorToList(
+                            tableEnv.executeSql("select * from test_sample tablesample (2 rows)")
+                                    .collect());
+            assertThat(result.toString()).isEqualTo("[+I[2], +I[1]]");
+            // test unsupported table sample
+            String expectedMessage = "Only TABLESAMPLE (n ROWS) is supported.";
+            assertSqlException(
+                    "select * from test_sample tablesample (0.1 PERCENT)",
+                    UnsupportedOperationException.class,
+                    expectedMessage);
+            assertSqlException(
+                    "select * from test_sample tablesample (100M)",
+                    UnsupportedOperationException.class,
+                    expectedMessage);
+            assertSqlException(
+                    "select * from test_sample tablesample (BUCKET 3 OUT OF 64 ON a)",
+                    UnsupportedOperationException.class,
+                    expectedMessage);
+        } finally {
+            tableEnv.executeSql("drop table test_sample");
+        }
+    }
+
+    private void assertSqlException(
+            String sql, Class<?> expectedExceptionClz, String expectedMessage) {
+        assertThatThrownBy(() -> tableEnv.executeSql(sql))
+                .rootCause()
+                .isInstanceOf(expectedExceptionClz)
+                .hasMessage(expectedMessage);
+    }
+
+    @Test
+    public void testInsertDirectory() throws Exception {
+        String warehouse = hiveCatalog.getHiveConf().getVar(HiveConf.ConfVars.METASTOREWAREHOUSE);
+
+        // test insert overwrite directory with row format parameters
+        tableEnv.executeSql("create table map_table (foo STRING , bar MAP<STRING, INT>)");
+        tableEnv.executeSql(
+                        "insert into map_table select 'A', map('math',100,'english',90,'history',85)")
+                .await();
+
+        String dataDir = warehouse + "/map_table_dir";
+        tableEnv.executeSql(
+                        String.format(
+                                "INSERT OVERWRITE LOCAL DIRECTORY '%s'"
+                                        + "ROW FORMAT DELIMITED \n"
+                                        + "FIELDS TERMINATED BY ':'\n"
+                                        + "COLLECTION ITEMS TERMINATED BY '#' \n"
+                                        + "MAP KEYS TERMINATED BY '=' select * from map_table",
+                                dataDir))
+                .await();
+        java.nio.file.Path[] files =
+                FileUtils.listFilesInDirectory(Paths.get(dataDir), this::isDataFile)
+                        .toArray(new Path[0]);
+        assertThat(files.length).isEqualTo(1);
+        String actualString = FileUtils.readFileUtf8(files[0].toFile());
+        assertThat(actualString.trim()).isEqualTo("A:english=90#math=100#history=85");
+
+        // test insert overwrite directory store as other format
+        tableEnv.executeSql("create table d_table(x int) PARTITIONED BY (ds STRING, hr STRING)");
+        tableEnv.executeSql("INSERT OVERWRITE TABLE d_table PARTITION (ds='1', hr='1') select 1")
+                .await();
+        tableEnv.executeSql("INSERT OVERWRITE TABLE d_table PARTITION (ds='1', hr='2') select 2")
+                .await();
+
+        String tableAggDir = warehouse + "/d_table_agg";
+        // create an external referring to the directory to be inserted
+        tableEnv.executeSql(
+                String.format(
+                        "create external table d_table_agg(x int, ds STRING) STORED AS RCFILE location '%s' ",
+                        tableAggDir));
+        // insert into directory stored as RCFILE
+        tableEnv.executeSql(
+                        String.format(
+                                "INSERT OVERWRITE DIRECTORY '%s' STORED AS RCFILE select count(x), ds from d_table group by ds ",
+                                tableAggDir))
+                .await();
+        List<Row> result =
+                CollectionUtil.iteratorToList(
+                        tableEnv.executeSql("select * from d_table_agg").collect());
+        // verify the data read from the external table
+        assertThat(result.toString()).isEqualTo("[+I[2, 1]]");
+    }
+
+    /**
+     * Checks whether the give file is a data file which must not be a hidden file or a success
+     * file.
+     */
+    private boolean isDataFile(Path path) {
+        String successFileName =
+                tableEnv.getConfig().get(HiveOptions.SINK_PARTITION_COMMIT_SUCCESS_FILE_NAME);
+        return !path.toFile().isHidden() && !path.toFile().getName().equals(successFileName);
+    }
+
+    @Test
+    public void testScriptTransform() throws Exception {
+        tableEnv.executeSql("CREATE TABLE dest1(key INT, ten INT, one INT, value STRING)");
+        tableEnv.executeSql("CREATE TABLE destp1 (key string) partitioned by (p1 int,p2 string)");
+        try {
+            // test explain transform
+            String actualPlan =
+                    explainSql(
+                            "select transform(key, value)"
+                                    + " ROW FORMAT SERDE 'MySerDe'"
+                                    + " WITH SERDEPROPERTIES ('p1'='v1','p2'='v2')"
+                                    + " RECORDWRITER 'MyRecordWriter' "
+                                    + " using 'cat' as (cola int, value string)"
+                                    + " ROW FORMAT DELIMITED FIELDS TERMINATED BY ','"
+                                    + " RECORDREADER 'MyRecordReader' from src");
+            assertThat(actualPlan).isEqualTo(readFromResource("/explain/testScriptTransform.out"));
+
+            // transform using + specified schema
+            List<Row> result =
+                    CollectionUtil.iteratorToList(
+                            tableEnv.executeSql(
+                                            "select * from (\n"
+                                                    + " select transform(key, value) ROW FORMAT DELIMITED FIELDS TERMINATED BY '\\003'"
+                                                    + " using 'cat'"
+                                                    + " as (cola int, value string) ROW FORMAT DELIMITED FIELDS TERMINATED BY '\\003'"
+                                                    + " from src\n"
+                                                    + " union all\n"
+                                                    + " select transform(key, value) ROW FORMAT DELIMITED FIELDS TERMINATED BY '\\003'"
+                                                    + " using 'cat' as (cola int, value string) from src) s")
+                                    .collect());
+            assertThat(result.toString())
+                    .isEqualTo(
+                            "[+I[1, val1], +I[2, val2], +I[3, val3], +I[1, val1], +I[2, val2], +I[3, val3]]");
+
+            // transform using + distributed by
+            tableEnv.executeSql(
+                            "from src insert overwrite table dest1 map src.key,"
+                                    + " CAST(src.key / 10 AS INT), CAST(src.key % 10 AS INT),"
+                                    + " src.value using 'cat' as (tkey, ten, one, tvalue)"
+                                    + " distribute by tvalue, tkey")
+                    .await();
+            result =
+                    CollectionUtil.iteratorToList(
+                            tableEnv.executeSql("select * from dest1").collect());
+            assertThat(result.toString())
+                    .isEqualTo("[+I[1, 0, 1, val1], +I[2, 0, 2, val2], +I[3, 0, 3, val3]]");
+
+            // transform using with default output schema(key string, value string) + insert into
+            // partitioned table
+            // `value` after this script transform will be null, so that will fall into Hive's
+            // default partition
+            tableEnv.executeSql(
+                            "insert into destp1 partition (p1=0,p2) (SELECT TRANSFORM(key, upper(value))"
+                                    + " USING 'tr \t _' FROM ((select key, value from src) tmp))")
+                    .await();
+            result =
+                    CollectionUtil.iteratorToList(
+                            tableEnv.executeSql("select * from destp1").collect());
+            String defaultPartitionName =
+                    hiveCatalog.getHiveConf().getVar(HiveConf.ConfVars.DEFAULTPARTITIONNAME);
+            assertThat(result.toString())
+                    .isEqualTo(
+                            String.format(
+                                    "[+I[1_VAL1, 0, %s], +I[2_VAL2, 0, %s], +I[3_VAL3, 0, %s]]",
+                                    defaultPartitionName,
+                                    defaultPartitionName,
+                                    defaultPartitionName));
+
+            // test use binary record reader
+            result =
+                    CollectionUtil.iteratorToList(
+                            tableEnv.executeSql(
+                                            "select transform(key) using 'cat' as (tkey)"
+                                                    + " RECORDREADER 'org.apache.hadoop.hive.ql.exec.BinaryRecordReader' from src")
+                                    .collect());
+            assertThat(result.toString()).isEqualTo("[+I[1\n2\n3\n]]");
+        } finally {
+            tableEnv.executeSql("drop table dest1");
+            tableEnv.executeSql("drop table destp1");
+        }
+    }
+
+    @Test
+    public void testMultiInsert() throws Exception {
+        tableEnv.executeSql("create table t1 (id bigint, name string)");
+        tableEnv.executeSql("create table t2 (id bigint, name string)");
+        tableEnv.executeSql("create table t3 (id bigint, name string, age int)");
+        try {
+            String multiInsertSql =
+                    "from (select id, name, age from t3) t"
+                            + " insert overwrite table t1 select id, name where age < 20"
+                            + "  insert overwrite table t2 select id, name where age > 20";
+            // test explain
+            String actualPlan = explainSql(multiInsertSql);
+            assertThat(actualPlan).isEqualTo(readFromResource("/explain/testMultiInsert.out"));
+            // test execution
+            tableEnv.executeSql("insert into table t3 values (1, 'test1', 18 ), (2, 'test2', 28 )")
+                    .await();
+            tableEnv.executeSql(multiInsertSql).await();
+            List<Row> result =
+                    CollectionUtil.iteratorToList(
+                            tableEnv.executeSql("select * from t1").collect());
+            assertThat(result.toString()).isEqualTo("[+I[1, test1]]");
+            result =
+                    CollectionUtil.iteratorToList(
+                            tableEnv.executeSql("select * from t2").collect());
+            assertThat(result.toString()).isEqualTo("[+I[2, test2]]");
+        } finally {
+            tableEnv.executeSql("drop table t1");
+            tableEnv.executeSql("drop table t2");
+            tableEnv.executeSql("drop table t3");
+        }
+    }
+
+    @Test
+    public void testNestType() throws Exception {
+        tableEnv.executeSql("CREATE TABLE dummy (i int)");
+        tableEnv.executeSql("INSERT INTO TABLE dummy VALUES (42)").await();
+        tableEnv.executeSql(
+                        "INSERT INTO TABLE nested SELECT\n"
+                                + "  1, named_struct('f1', false, 'f2', 'foo', 'f3', named_struct('f4', 4, 'f5', cast(5.0 as double)), 'f6', 4),\n"
+                                + "  named_struct('f7', 'f7', 'f8', named_struct('f9', true, 'f10', array(10, 11), 'f11', map('key1', true, 'key2', false))),\n"
+                                + "  named_struct('f12', array(named_struct('f13', 'foo', 'f14', 14), named_struct('f13', 'bar', 'f14', 28))),\n"
+                                + "  map('key1', named_struct('f15', 1), 'key2', named_struct('f15', 2)),\n"
+                                + "  named_struct('f16', array(named_struct('f17', 'foo', 'f18', named_struct('f19', 14)), named_struct('f17', 'bar', 'f18', named_struct('f19', 28)))),\n"
+                                + "  map('key1', named_struct('f20', array(named_struct('f21', named_struct('f22', 1)))),\n"
+                                + "      'key2', named_struct('f20', array(named_struct('f21', named_struct('f22', 2)))))\n"
+                                + "FROM dummy")
+                .await();
+
+        List<Row> result =
+                CollectionUtil.iteratorToList(
+                        tableEnv.executeSql("select s3.f12[0].f14 FROM nested").collect());
+        assertThat(result.toString()).isEqualTo("[+I[14]]");
+
+        result =
+                CollectionUtil.iteratorToList(
+                        tableEnv.executeSql("SELECT s6['key1'].f20.f21.f22 FROM nested").collect());
+        assertThat(result.toString()).isEqualTo("[+I[[1]]]");
+
+        result =
+                CollectionUtil.iteratorToList(
+                        tableEnv.executeSql("SELECT s5.f16.f18.f19 FROM nested").collect());
+        assertThat(result.toString()).isEqualTo("[+I[[14, 28]]]");
+    }
+
+    @Test
+    public void testWithOverWindow() throws Exception {
+        tableEnv.executeSql("create table over_test(a int, b int, c int, d int)");
+        try {
+            tableEnv.executeSql(
+                            "insert into over_test values(3, 2, 1, 4), (1, 2, 3, 4), (2, 1, 4, 4)")
+                    .await();
+            List<Row> result =
+                    CollectionUtil.iteratorToList(
+                            tableEnv.executeSql(
+                                            "select a, count(b) over(order by a rows between 1 preceding and 1 following) from over_test")
+                                    .collect());
+            assertThat(result.toString()).isEqualTo("[+I[1, 2], +I[2, 3], +I[3, 2]]");
+
+            result =
+                    CollectionUtil.iteratorToList(
+                            tableEnv.executeSql(
+                                            "select a, count(b) over(order by a rows between 1 preceding and 1 following),"
+                                                    + " count(c) over(distribute by a sort by b range between 5 preceding and current row)"
+                                                    + " from over_test")
+                                    .collect());
+            assertThat(result.toString()).isEqualTo("[+I[1, 2, 1], +I[2, 3, 1], +I[3, 2, 1]]");
+        } finally {
+            tableEnv.executeSql("drop table over_test");
+        }
+    }
+
+    @Test
+    public void testLoadData() throws Exception {
+        tableEnv.executeSql("create table tab1 (col1 int, col2 int) stored as orc");
+        tableEnv.executeSql("create table tab2 (col1 int, col2 int) STORED AS ORC");
+        tableEnv.executeSql(
+                "create table p_table(col1 int, col2 int) partitioned by (dateint int) row format delimited fields terminated by ','");
+        try {
+            String testLoadCsvFilePath =
+                    Objects.requireNonNull(getClass().getResource("/csv/test.csv")).toString();
+            // test explain
+            String actualPlan =
+                    explainSql(
+                            String.format(
+                                    "load data local inpath '%s' overwrite into table p_table partition (dateint=2022) ",
+                                    testLoadCsvFilePath));
+            assertThat(actualPlan)
+                    .isEqualTo(
+                            readFromResource("/explain/testLoadData.out")
+                                    .replace("$filepath", testLoadCsvFilePath));
+
+            // test load data into table
+            tableEnv.executeSql("insert into tab1 values (1, 1), (1, 2)").await();
+            tableEnv.executeSql(
+                    String.format(
+                            "load data local inpath '%s' INTO TABLE tab2", warehouse + "/tab1"));
+            List<Row> result =
+                    CollectionUtil.iteratorToList(
+                            tableEnv.executeSql("select * from tab2").collect());
+            assertThat(result.toString()).isEqualTo("[+I[1, 1], +I[1, 2]]");
+            // there should still exist data in tab1
+            result =
+                    CollectionUtil.iteratorToList(
+                            tableEnv.executeSql("select * from tab1").collect());
+            assertThat(result.toString()).isEqualTo("[+I[1, 1], +I[1, 2]]");
+
+            // test load data overwrite
+            tableEnv.executeSql("insert overwrite table tab1 values (2, 1), (2, 2)").await();
+            tableEnv.executeSql(
+                    String.format(
+                            "load data local inpath '%s' overwrite into table tab2",
+                            warehouse + "/tab1"));
+            result =
+                    CollectionUtil.iteratorToList(
+                            tableEnv.executeSql("select * from tab2").collect());
+            assertThat(result.toString()).isEqualTo("[+I[2, 1], +I[2, 2]]");
+
+            // test load data into partition
+            tableEnv.executeSql(
+                            String.format(
+                                    "load data inpath '%s' into table p_table partition (dateint=2022) ",
+                                    testLoadCsvFilePath))
+                    .await();
+            // the file should be removed
+            assertThat(new File(testLoadCsvFilePath).exists()).isFalse();
+            result =
+                    CollectionUtil.iteratorToList(
+                            tableEnv.executeSql("select * from p_table where dateint=2022")
+                                    .collect());
+            assertThat(result.toString())
+                    .isEqualTo("[+I[1, 1, 2022], +I[2, 2, 2022], +I[3, 3, 2022]]");
+        } finally {
+            tableEnv.executeSql("drop table tab1");
+            tableEnv.executeSql("drop table tab2");
+            tableEnv.executeSql("drop table p_table");
+        }
+    }
+
+    @Test
+    public void testBoolComparison() throws Exception {
+        tableEnv.executeSql("CREATE TABLE tbool (id int, a int, b string, c boolean)");
+        try {
+            tableEnv.executeSql("insert into tbool values (1, 1, '12', true), (2, 1, '0.4', false)")
+                    .await();
+            // test compare boolean with numeric/string type
+            List<Row> results =
+                    CollectionUtil.iteratorToList(
+                            tableEnv.executeSql(
+                                            "select id from tbool where a = true and b != false and c = '1'")
+                                    .collect());
+            assertThat(results.toString()).isEqualTo("[+I[1]]");
+        } finally {
+            tableEnv.executeSql("drop table tbool");
+        }
+    }
+
+    @Test
+    public void testCastTimeStampToDecimal() throws Exception {
+        try {
+            String timestamp = "2012-12-19 11:12:19.1234567";
+            // timestamp's behavior is different between hive2 and hive3, so
+            // use HiveShim in this test to hide such difference
+            HiveShim hiveShim = HiveShimLoader.loadHiveShim(HiveShimLoader.getHiveVersion());
+            Object hiveTimestamp = hiveShim.toHiveTimestamp(Timestamp.valueOf(timestamp));
+            TimestampObjectInspector timestampObjectInspector =
+                    (TimestampObjectInspector)
+                            HiveInspectors.getObjectInspector(TypeInfoFactory.timestampTypeInfo);
+
+            HiveDecimal expectTimeStampDecimal =
+                    timestampObjectInspector
+                            .getPrimitiveWritableObject(hiveTimestamp)
+                            .getHiveDecimal();
+
+            // test cast timestamp to decimal explicitly
+            List<Row> results =
+                    CollectionUtil.iteratorToList(
+                            tableEnv.executeSql(
+                                            String.format(
+                                                    "select cast(cast('%s' as timestamp) as decimal(30,8))",
+                                                    timestamp))
+                                    .collect());
+            assertThat(results.toString())
+                    .isEqualTo(String.format("[+I[%s]]", expectTimeStampDecimal));
+
+            // test insert timestamp type to decimal type directly
+            tableEnv.executeSql("create table t1 (c1 DECIMAL(38,6))");
+            tableEnv.executeSql("create table t2 (c2 TIMESTAMP)");
+            tableEnv.executeSql(String.format("insert into t2 values('%s')", timestamp)).await();
+            tableEnv.executeSql("insert into t1 select * from t2").await();
+            results =
+                    CollectionUtil.iteratorToList(
+                            tableEnv.executeSql("select * from t1").collect());
+            assertThat(results.toString())
+                    .isEqualTo(String.format("[+I[%s]]", expectTimeStampDecimal.toFormatString(6)));
+        } finally {
+            tableEnv.executeSql("drop table t1");
+            tableEnv.executeSql("drop table t2");
+        }
+    }
+
+    @Test
+    public void testCount() throws Exception {
+        tableEnv.executeSql("create table abcd (a int, b int, c int, d int)");
+        tableEnv.executeSql(
+                        "insert into abcd values (null,35,23,6), (10, 100, 23, 5), (10, 35, 23, 5)")
+                .await();
+        try {
+            List<Row> results =
+                    CollectionUtil.iteratorToList(
+                            tableEnv.executeSql(
+                                            "select count(1), count(*), count(a),"
+                                                    + " count(distinct a,b), count(distinct b,d), count(distinct b, c) from abcd")
+                                    .collect());
+            assertThat(results.toString()).isEqualTo("[+I[3, 3, 2, 2, 3, 2]]");
+            assertThatThrownBy(() -> tableEnv.executeSql(" select count(a,b) from abcd"))
+                    .hasRootCauseInstanceOf(UDFArgumentException.class)
+                    .hasRootCauseMessage("DISTINCT keyword must be specified");
+        } finally {
+            tableEnv.executeSql("drop table abcd");
+        }
+    }
+
     private void runQFile(File qfile) throws Exception {
         QTest qTest = extractQTest(qfile);
         for (int i = 0; i < qTest.statements.size(); i++) {
@@ -457,6 +941,13 @@ public class HiveDialectQueryITCase {
             System.out.println("Failed to run " + query);
             throw e;
         }
+    }
+
+    private String explainSql(String sql) {
+        return (String)
+                CollectionUtil.iteratorToList(tableEnv.executeSql("explain " + sql).collect())
+                        .get(0)
+                        .getField(0);
     }
 
     private static TableEnvironment getTableEnvWithHiveCatalog() {

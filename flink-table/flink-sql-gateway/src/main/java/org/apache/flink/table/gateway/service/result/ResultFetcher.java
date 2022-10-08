@@ -22,6 +22,7 @@ import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.table.catalog.ResolvedSchema;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.gateway.api.operation.OperationHandle;
+import org.apache.flink.table.gateway.api.results.FetchOrientation;
 import org.apache.flink.table.gateway.api.results.ResultSet;
 import org.apache.flink.table.gateway.service.utils.SqlExecutionException;
 import org.apache.flink.util.CloseableIterator;
@@ -29,6 +30,7 @@ import org.apache.flink.util.CloseableIterator;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Iterator;
 import java.util.LinkedList;
@@ -47,6 +49,7 @@ import java.util.Optional;
 public class ResultFetcher {
 
     private static final Logger LOG = LoggerFactory.getLogger(ResultFetcher.class);
+    private static final int TABLE_RESULT_MAX_INITIAL_CAPACITY = 5000;
 
     private final OperationHandle operationHandle;
 
@@ -61,6 +64,14 @@ public class ResultFetcher {
     public ResultFetcher(
             OperationHandle operationHandle,
             ResolvedSchema resultSchema,
+            CloseableIterator<RowData> resultRows) {
+        this(operationHandle, resultSchema, resultRows, TABLE_RESULT_MAX_INITIAL_CAPACITY);
+    }
+
+    @VisibleForTesting
+    ResultFetcher(
+            OperationHandle operationHandle,
+            ResolvedSchema resultSchema,
             CloseableIterator<RowData> resultRows,
             int maxBufferSize) {
         this.operationHandle = operationHandle;
@@ -68,16 +79,49 @@ public class ResultFetcher {
         this.resultStore = new ResultStore(resultRows, maxBufferSize);
     }
 
+    public ResultFetcher(
+            OperationHandle operationHandle, ResolvedSchema resultSchema, List<RowData> rows) {
+        this.operationHandle = operationHandle;
+        this.resultSchema = resultSchema;
+        this.bufferedResults.addAll(rows);
+        this.resultStore = ResultStore.DUMMY_RESULT_STORE;
+    }
+
     public void close() {
         resultStore.close();
+    }
+
+    public ResolvedSchema getResultSchema() {
+        return resultSchema;
+    }
+
+    public synchronized ResultSet fetchResults(FetchOrientation orientation, int maxFetchSize) {
+        long token;
+        switch (orientation) {
+            case FETCH_NEXT:
+                token = currentToken;
+                break;
+            case FETCH_PRIOR:
+                token = currentToken - 1;
+                break;
+            default:
+                throw new UnsupportedOperationException(
+                        String.format("Unknown fetch orientation: %s.", orientation));
+        }
+
+        if (orientation == FetchOrientation.FETCH_NEXT && bufferedResults.isEmpty()) {
+            // make sure data is available in the buffer
+            resultStore.waitUntilHasData();
+        }
+
+        return fetchResults(token, maxFetchSize);
     }
 
     /**
      * Fetch results from the result store. It tries to return the data cached in the buffer first.
      * If the buffer is empty, then fetch results from the {@link ResultStore}. It's possible
      * multiple threads try to fetch results in parallel. To keep the data integration, use the
-     * synchronized to allow only one thread can fetch the result at any time. TODO: we should
-     * forbid concurrently fetch results in the FLINK-28053.
+     * synchronized to allow only one thread can fetch the result at any time.
      */
     public synchronized ResultSet fetchResults(long token, int maxFetchSize) {
         if (maxFetchSize <= 0) {
@@ -123,7 +167,10 @@ public class ResultFetcher {
                 bufferedPrevResults.add(bufferedResults.removeFirst());
             }
             return new ResultSet(
-                    ResultSet.ResultType.PAYLOAD, currentToken, resultSchema, bufferedPrevResults);
+                    ResultSet.ResultType.PAYLOAD,
+                    currentToken,
+                    resultSchema,
+                    new ArrayList<>(bufferedPrevResults));
         } else if (token == currentToken - 1 && token >= 0) {
             if (LOG.isDebugEnabled()) {
                 LOG.debug(
@@ -144,7 +191,10 @@ public class ResultFetcher {
                 throw new SqlExecutionException(msg);
             }
             return new ResultSet(
-                    ResultSet.ResultType.PAYLOAD, currentToken, resultSchema, bufferedPrevResults);
+                    ResultSet.ResultType.PAYLOAD,
+                    currentToken,
+                    resultSchema,
+                    new ArrayList<>(bufferedPrevResults));
         } else {
             String msg;
             if (currentToken == 0) {

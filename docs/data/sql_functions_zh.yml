@@ -159,7 +159,7 @@ arithmetic:
     table: NUMERIC1 + NUMERIC2
     description: 返回 numeric1 加 numeric2。
   - sql: numeric1 - numeric2
-    table: NUMERIC1 + NUMERIC2
+    table: NUMERIC1 - NUMERIC2
     description: 返回 numeric1 减 numeric2。
   - sql: numeric1 * numberic2
     table: NUMERIC1 * NUMERIC2
@@ -462,12 +462,15 @@ string:
       如果 string1 的任何（可能为空）子字符串与 Java 正则表达式 string2 匹配，则返回 TRUE，否则返回 FALSE。
       如果有任一参数为 `NULL`，则返回 `NULL`。
   - sql: REVERSE(string)
+    table: STRING.reverse()
     description: 返回反转的字符串。如果字符串为 `NULL`，则返回 `NULL`。
   - sql: SPLIT_INDEX(string1, string2, integer1)
+    table: STRING1.splitIndex(STRING2, INTEGER1)
     description: |
-      通过分隔符 string2 拆分 string1，返回拆分字符串的第 integer（从零开始）个字符串。如果整数为负，则返回 `NULL`。
+      通过分隔符 string2 拆分 string1，返回分隔后这组字符串的第 integer（从零开始）个字符串。如果整数为负，则返回 `NULL`。
       如果有任一参数为 `NULL`，则返回 `NULL`。
   - sql: STR_TO_MAP(string1[, string2, string3])
+    table: STRING1.strToMap([STRING2, STRING3])
     description: |
       使用分隔符将 string1 拆分为键值对后返回一个 map。string2 是 pair 分隔符，默认为 ','。string3 是键值分隔符，默认为 '='。
       pair 分隔符与键值分隔符均为正则表达式，当使用特殊字符作为分隔符时请提前进行转义，例如 `<([{\^-=$!|]})?*+.>`。
@@ -562,7 +565,7 @@ temporal:
   - sql: DAYOFMONTH
     description: |
       从 SQL 日期 date 返回一个月中的第几天（1 到 31 之间的整数）。相当于 EXTRACT(DAY FROM date)。
-      例如 `DAYOFWEEK(DATE '1994-09-27')` 返回 3。
+      例如 `DAYOFMONTH(DATE '1994-09-27')` 返回 27。
   - sql: HOUR(timestamp)
     description: |
       从 SQL 时间戳 timestamp 返回小时单位部分的小时（0 到 23 之间的整数）数。相当于 EXTRACT(HOUR FROM timestamp)。
@@ -808,7 +811,10 @@ json:
 
       对于空路径表达式或错误，可以将行为定义为返回 `null`、引发错误或返回定义的默认值。当省略时，默认为 `NULL ON EMPTY` 或
       `NULL ON ERROR`。默认值可以是文字或表达式。如果默认值本身引发错误，通过错误就会造成 `ON EMPTY` 的行为，并引发 `ON ERROR` 的错误。
-
+ 
+      对于路径表达式中包含特殊字符（如空格），你可以使用`['property']` 获 `["property"]`来引用父对象中指定的属性。请确保在属性名两侧加上单引号或双引号。
+      当在 SQL 使用 JSON_VALUE 时，路径作为一个字符串参数已经被单引号引用了，因此你必须将属性名上的单引号转义，如`JSON_VALUE('{"a b": "true"}', '$.[''a b'']')`。
+      
       ```
       -- "true"
       JSON_VALUE('{"a": true}', '$.a')
@@ -827,6 +833,9 @@ json:
       -- 0.998D
       JSON_VALUE('{"a.b": [0.998,0.996]}','$.["a.b"][0]'
           RETURNING DOUBLE)
+      
+      -- "right"
+      JSON_VALUE('{"contains blank": "right"}', 'strict $.[''contains blank'']' NULL ON EMPTY DEFAULT 'wrong' ON ERROR)
       ```
   - sql: JSON_QUERY(jsonValue, path [ { WITHOUT | WITH CONDITIONAL | WITH UNCONDITIONAL } [ ARRAY ] WRAPPER ] [ { NULL | EMPTY ARRAY | EMPTY OBJECT | ERROR } ON EMPTY ] [ { NULL | EMPTY ARRAY | EMPTY OBJECT | ERROR } ON ERROR ])
     table: STRING.jsonQuery(path [, JsonQueryWrapper [, JsonQueryOnEmptyOrError, JsonQueryOnEmptyOrError ] ])
@@ -1092,4 +1101,19 @@ aggregate:
     table: FIELD.lastValue
     description: 返回一组有序值中的最后一个值。
   - sql: LISTAGG(expression [, separator])
+    table: FIELD.listagg
     description: 连接字符串表达式的值并在它们之间放置分隔符值。字符串末尾不添加分隔符时则分隔符的默认值为“,”。
+  - sql: CUME_DIST()
+    description: 返回值在一组值的累积分布。结果是小于或等于当前行的值的行数除以窗口分区的总行数。
+  - sql: PERCENT_RANK()
+    description: 返回值在一组值的百分比排名。结果是当前行在窗口分区中的排名减 1，然后除以窗口分区的总行数减 1。如果窗口分区的总行数为 1，则该函数返回 0。
+  - sql: NTILE(n)
+    description: |
+      将窗口分区中的所有数据按照顺序划分为 n 个分组，返回分配给各行数据的分组编号（从 1 开始）。
+      如果不能均匀划分为 n 个分组，则从第 1 个分组开始，为每一分组分配一个剩余值。
+      比如某个窗口分区有 6 行数据，划分为 4 个分组，则各行的分组编号为：1，1，2，2，3，4。
+
+catalog:
+  - sql: CURRENT_DATABASE()
+    table: currentDatabase()
+    description: 返回当前数据库。

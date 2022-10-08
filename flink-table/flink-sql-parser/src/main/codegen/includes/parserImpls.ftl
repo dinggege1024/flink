@@ -1111,6 +1111,7 @@ SqlCreate SqlCreateTable(Span s, boolean replace, boolean isTemporary) :
     SqlNodeList columnList = SqlNodeList.EMPTY;
 	SqlCharStringLiteral comment = null;
 	SqlTableLike tableLike = null;
+    SqlNode asQuery = null;
 
     SqlNodeList propertyList = SqlNodeList.EMPTY;
     SqlNodeList partitionColumns = SqlNodeList.EMPTY;
@@ -1151,9 +1152,8 @@ SqlCreate SqlCreateTable(Span s, boolean replace, boolean isTemporary) :
     [
         <LIKE>
         tableLike = SqlTableLike(getPos())
-    ]
-    {
-        return new SqlCreateTable(startPos.plus(getPos()),
+        {
+            return new SqlCreateTableLike(startPos.plus(getPos()),
                 tableName,
                 columnList,
                 constraints,
@@ -1164,6 +1164,35 @@ SqlCreate SqlCreateTable(Span s, boolean replace, boolean isTemporary) :
                 tableLike,
                 isTemporary,
                 ifNotExists);
+        }
+    |
+        <AS>
+        asQuery = OrderedQueryOrExpr(ExprContext.ACCEPT_QUERY)
+        {
+            return new SqlCreateTableAs(startPos.plus(getPos()),
+                tableName,
+                columnList,
+                constraints,
+                propertyList,
+                partitionColumns,
+                watermark,
+                comment,
+                asQuery,
+                isTemporary,
+                ifNotExists);
+        }
+    ]
+    {
+        return new SqlCreateTable(startPos.plus(getPos()),
+            tableName,
+            columnList,
+            constraints,
+            propertyList,
+            partitionColumns,
+            watermark,
+            comment,
+            isTemporary,
+            ifNotExists);
     }
 }
 
@@ -2201,5 +2230,98 @@ SqlNode TryCastFunctionCall() :
     <RPAREN>
     {
         return operator.createCall(s.end(this), args);
+    }
+}
+
+/**
+* Parses a partition key/value,
+* e.g. p or p = '10'.
+*/
+SqlPartitionSpecProperty PartitionSpecProperty():
+{
+    final SqlParserPos pos;
+    final SqlIdentifier key;
+    SqlNode value = null;
+}
+{
+    key = SimpleIdentifier() { pos = getPos(); }
+    [
+        LOOKAHEAD(1)
+        <EQ> value = Literal()
+    ]
+    {
+        return new SqlPartitionSpecProperty(key, value, pos);
+    }
+}
+
+/**
+* Parses a partition specifications statement,
+* e.g. ANALYZE TABLE tbl1 partition(col1='val1', col2='val2') xxx
+* or
+* ANALYZE TABLE tbl1 partition(col1, col2) xxx.
+* or
+* ANALYZE TABLE tbl1 partition(col1='val1', col2) xxx.
+*/
+void ExtendedPartitionSpecCommaList(SqlNodeList list) :
+{
+    SqlPartitionSpecProperty property;
+}
+{
+    <LPAREN>
+    property = PartitionSpecProperty()
+    {
+       list.add(property);
+    }
+    (
+        <COMMA> property = PartitionSpecProperty()
+        {
+            list.add(property);
+        }
+    )*
+    <RPAREN>
+}
+
+/** Parses a comma-separated list of simple identifiers with position. */
+SqlNodeList SimpleIdentifierCommaListWithPosition() :
+{
+    final Span s;
+    final List<SqlNode> list = new ArrayList<SqlNode>();
+}
+{
+    { s = span(); }
+    SimpleIdentifierCommaList(list) {
+        return new SqlNodeList(list, s.end(this));
+    }
+}
+
+/** Parses an ANALYZE TABLE statement. */
+SqlNode SqlAnalyzeTable():
+{
+       final Span s;
+       final SqlIdentifier tableName;
+       SqlNodeList partitionSpec = SqlNodeList.EMPTY;
+       SqlNodeList columns = SqlNodeList.EMPTY;
+       boolean allColumns = false;
+}
+{
+    <ANALYZE> <TABLE> { s = span(); }
+    tableName = CompoundIdentifier()
+    [
+        <PARTITION> {
+            partitionSpec = new SqlNodeList(getPos());
+            ExtendedPartitionSpecCommaList(partitionSpec);
+        }
+    ]
+
+    <COMPUTE> <STATISTICS> [ <FOR>
+        (
+           <COLUMNS> { columns = SimpleIdentifierCommaListWithPosition(); }
+        |
+           <ALL> <COLUMNS> { allColumns = true; }
+        )
+    ]
+
+    {
+        return new SqlAnalyzeTable(s.end(this), tableName, partitionSpec, columns, allColumns);
     }
 }

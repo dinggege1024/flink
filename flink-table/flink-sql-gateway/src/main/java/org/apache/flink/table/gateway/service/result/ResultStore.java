@@ -18,7 +18,6 @@
 
 package org.apache.flink.table.gateway.service.result;
 
-import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.gateway.service.utils.SqlExecutionException;
 import org.apache.flink.util.CloseableIterator;
@@ -36,6 +35,13 @@ import java.util.concurrent.atomic.AtomicReference;
 public class ResultStore {
 
     private static final Logger LOG = LoggerFactory.getLogger(ResultStore.class);
+
+    public static final ResultStore DUMMY_RESULT_STORE =
+            new ResultStore(CloseableIterator.adapterForIterator(Collections.emptyIterator()), 0);
+
+    static {
+        DUMMY_RESULT_STORE.close();
+    }
 
     private final CloseableIterator<RowData> result;
     private final List<RowData> recordsBuffer = new ArrayList<>();
@@ -73,7 +79,7 @@ public class ResultStore {
                 } else {
                     final List<RowData> change = new ArrayList<>(recordsBuffer);
                     recordsBuffer.clear();
-                    resultLock.notify();
+                    resultLock.notifyAll();
                     return Optional.of(change);
                 }
             }
@@ -90,14 +96,25 @@ public class ResultStore {
         }
     }
 
-    @VisibleForTesting
     public int getBufferedRecordSize() {
         synchronized (resultLock) {
             return recordsBuffer.size();
         }
     }
 
-    private boolean isRetrieving() {
+    public void waitUntilHasData() {
+        synchronized (resultLock) {
+            while (isRetrieving() && recordsBuffer.isEmpty()) {
+                try {
+                    resultLock.wait();
+                } catch (InterruptedException e) {
+                    throw new SqlExecutionException("Failed to wait the result is ready.", e);
+                }
+            }
+        }
+    }
+
+    public boolean isRetrieving() {
         return retrievalThread.isRunning;
     }
 
@@ -121,6 +138,8 @@ public class ResultStore {
                 }
             }
             recordsBuffer.add(row);
+            // Notify the consumer to consume
+            resultLock.notifyAll();
         }
     }
 
@@ -144,6 +163,10 @@ public class ResultStore {
             // no result anymore
             // either the job is done or an error occurred
             isRunning = false;
+
+            synchronized (resultLock) {
+                resultLock.notify();
+            }
         }
     }
 }

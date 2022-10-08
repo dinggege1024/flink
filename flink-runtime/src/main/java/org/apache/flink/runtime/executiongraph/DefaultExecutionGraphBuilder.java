@@ -138,7 +138,8 @@ public class DefaultExecutionGraphBuilder {
                             vertexAttemptNumberStore,
                             vertexParallelismStore,
                             isDynamicGraph,
-                            executionJobVertexFactory);
+                            executionJobVertexFactory,
+                            jobGraph.getJobStatusHooks());
         } catch (IOException e) {
             throw new JobException("Could not create the ExecutionGraph.", e);
         }
@@ -172,7 +173,12 @@ public class DefaultExecutionGraphBuilder {
             }
 
             try {
-                vertex.initializeOnMaster(classLoader);
+                vertex.initializeOnMaster(
+                        new SimpleInitializeOnMasterContext(
+                                classLoader,
+                                vertexParallelismStore
+                                        .getParallelismInfo(vertex.getID())
+                                        .getParallelism()));
             } catch (Throwable t) {
                 throw new JobExecutionException(
                         jobId,

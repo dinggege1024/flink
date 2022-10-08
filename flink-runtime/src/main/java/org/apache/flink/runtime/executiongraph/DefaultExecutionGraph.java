@@ -77,6 +77,7 @@ import org.apache.flink.runtime.shuffle.ShuffleDescriptor;
 import org.apache.flink.runtime.shuffle.ShuffleMaster;
 import org.apache.flink.runtime.state.CheckpointStorage;
 import org.apache.flink.runtime.state.StateBackend;
+import org.apache.flink.runtime.state.StateBackendLoader;
 import org.apache.flink.runtime.taskmanager.DispatcherThreadFactory;
 import org.apache.flink.types.Either;
 import org.apache.flink.util.ExceptionUtils;
@@ -84,6 +85,7 @@ import org.apache.flink.util.FlinkException;
 import org.apache.flink.util.IterableUtils;
 import org.apache.flink.util.OptionalFailure;
 import org.apache.flink.util.SerializedValue;
+import org.apache.flink.util.TernaryBoolean;
 import org.apache.flink.util.concurrent.FutureUtils;
 import org.apache.flink.util.concurrent.FutureUtils.ConjunctFuture;
 import org.apache.flink.util.concurrent.ScheduledExecutorServiceAdapter;
@@ -271,6 +273,8 @@ public class DefaultExecutionGraph implements ExecutionGraph, InternalExecutionG
 
     @Nullable private String changelogStorageName;
 
+    @Nullable private TernaryBoolean stateChangelogEnabled;
+
     private String jsonPlan;
 
     /** Shuffle master to register partitions for task deployment. */
@@ -288,6 +292,8 @@ public class DefaultExecutionGraph implements ExecutionGraph, InternalExecutionG
     private final boolean isDynamic;
 
     private final ExecutionJobVertex.Factory executionJobVertexFactory;
+
+    private final List<JobStatusHook> jobStatusHooks;
 
     // --------------------------------------------------------------------------------------------
     //   Constructors
@@ -311,7 +317,8 @@ public class DefaultExecutionGraph implements ExecutionGraph, InternalExecutionG
             VertexAttemptNumberStore initialAttemptCounts,
             VertexParallelismStore vertexParallelismStore,
             boolean isDynamic,
-            ExecutionJobVertex.Factory executionJobVertexFactory)
+            ExecutionJobVertex.Factory executionJobVertexFactory,
+            List<JobStatusHook> jobStatusHooks)
             throws IOException {
 
         this.executionGraphId = new ExecutionGraphID();
@@ -381,10 +388,14 @@ public class DefaultExecutionGraph implements ExecutionGraph, InternalExecutionG
 
         this.executionJobVertexFactory = checkNotNull(executionJobVertexFactory);
 
+        this.jobStatusHooks = checkNotNull(jobStatusHooks);
+
         LOG.info(
                 "Created execution graph {} for job {}.",
                 executionGraphId,
                 jobInformation.getJobId());
+        // Trigger hook onCreated
+        notifyJobStatusHooks(state, null);
     }
 
     @Override
@@ -411,6 +422,11 @@ public class DefaultExecutionGraph implements ExecutionGraph, InternalExecutionG
     @Nonnull
     public ComponentMainThreadExecutor getJobMasterMainThreadExecutor() {
         return jobMasterMainThreadExecutor;
+    }
+
+    @Override
+    public TernaryBoolean isChangelogStateBackendEnabled() {
+        return stateChangelogEnabled;
     }
 
     @Override
@@ -510,7 +526,11 @@ public class DefaultExecutionGraph implements ExecutionGraph, InternalExecutionG
             registerJobStatusListener(checkpointCoordinator.createActivatorDeactivator());
         }
 
-        this.stateBackendName = checkpointStateBackend.getClass().getSimpleName();
+        this.stateBackendName = checkpointStateBackend.getName();
+        this.stateChangelogEnabled =
+                TernaryBoolean.fromBoolean(
+                        StateBackendLoader.isChangelogStateBackend(checkpointStateBackend));
+
         this.checkpointStorageName = checkpointStorage.getClass().getSimpleName();
         this.changelogStorageName = changelogStorageName;
     }
@@ -1139,6 +1159,7 @@ public class DefaultExecutionGraph implements ExecutionGraph, InternalExecutionG
 
             stateTimestamps[newState.ordinal()] = System.currentTimeMillis();
             notifyJobStatusChange(newState);
+            notifyJobStatusHooks(newState, error);
             return true;
         } else {
             return false;
@@ -1194,7 +1215,10 @@ public class DefaultExecutionGraph implements ExecutionGraph, InternalExecutionG
 
             try {
                 for (ExecutionJobVertex ejv : verticesInCreationOrder) {
-                    ejv.getJobVertex().finalizeOnMaster(getUserClassLoader());
+                    ejv.getJobVertex()
+                            .finalizeOnMaster(
+                                    new SimpleInitializeOnMasterContext(
+                                            getUserClassLoader(), ejv.getParallelism()));
                 }
             } catch (Throwable t) {
                 ExceptionUtils.rethrowIfFatalError(t);
@@ -1391,6 +1415,7 @@ public class DefaultExecutionGraph implements ExecutionGraph, InternalExecutionG
             final List<ConsumedPartitionGroup> releasablePartitionGroups) {
 
         if (releasablePartitionGroups.size() > 0) {
+            final List<ResultPartitionID> releasablePartitionIds = new ArrayList<>();
 
             // Remove the cache of ShuffleDescriptors when ConsumedPartitionGroups are released
             for (ConsumedPartitionGroup releasablePartitionGroup : releasablePartitionGroups) {
@@ -1398,14 +1423,16 @@ public class DefaultExecutionGraph implements ExecutionGraph, InternalExecutionG
                         checkNotNull(
                                 intermediateResults.get(
                                         releasablePartitionGroup.getIntermediateDataSetID()));
+                for (IntermediateResultPartitionID partitionId : releasablePartitionGroup) {
+                    IntermediateResultPartition partition =
+                            totalResult.getPartitionById(partitionId);
+                    partition.markPartitionGroupReleasable(releasablePartitionGroup);
+                    if (partition.canBeReleased()) {
+                        releasablePartitionIds.add(createResultPartitionId(partitionId));
+                    }
+                }
                 totalResult.clearCachedInformationForPartitionGroup(releasablePartitionGroup);
             }
-
-            final List<ResultPartitionID> releasablePartitionIds =
-                    releasablePartitionGroups.stream()
-                            .flatMap(IterableUtils::toStream)
-                            .map(this::createResultPartitionId)
-                            .collect(Collectors.toList());
 
             partitionTracker.stopTrackingAndReleasePartitions(releasablePartitionIds);
         }
@@ -1540,6 +1567,31 @@ public class DefaultExecutionGraph implements ExecutionGraph, InternalExecutionG
                 } catch (Throwable t) {
                     LOG.warn("Error while notifying JobStatusListener", t);
                 }
+            }
+        }
+    }
+
+    private void notifyJobStatusHooks(JobStatus newState, @Nullable Throwable cause) {
+        JobID jobID = jobInformation.getJobId();
+        for (JobStatusHook hook : jobStatusHooks) {
+            try {
+                switch (newState) {
+                    case CREATED:
+                        hook.onCreated(jobID);
+                        break;
+                    case CANCELED:
+                        hook.onCanceled(jobID);
+                        break;
+                    case FAILED:
+                        hook.onFailed(jobID, cause);
+                        break;
+                    case FINISHED:
+                        hook.onFinished(jobID);
+                        break;
+                }
+            } catch (Throwable e) {
+                throw new RuntimeException(
+                        "Error while notifying JobStatusHook[" + hook.getClass() + "]", e);
             }
         }
     }

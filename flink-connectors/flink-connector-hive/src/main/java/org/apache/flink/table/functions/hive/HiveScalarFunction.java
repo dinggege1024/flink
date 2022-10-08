@@ -52,16 +52,12 @@ public abstract class HiveScalarFunction<UDFType> extends ScalarFunction
 
     @Override
     public boolean isDeterministic() {
-        try {
-            org.apache.hadoop.hive.ql.udf.UDFType udfType =
-                    hiveFunctionWrapper
-                            .getUDFClass()
-                            .getAnnotation(org.apache.hadoop.hive.ql.udf.UDFType.class);
+        org.apache.hadoop.hive.ql.udf.UDFType udfType =
+                hiveFunctionWrapper
+                        .getUDFClass()
+                        .getAnnotation(org.apache.hadoop.hive.ql.udf.UDFType.class);
 
-            return udfType != null && udfType.deterministic() && !udfType.stateful();
-        } catch (ClassNotFoundException e) {
-            throw new FlinkHiveUDFException(e);
-        }
+        return udfType != null && udfType.deterministic() && !udfType.stateful();
     }
 
     @Override
@@ -83,7 +79,7 @@ public abstract class HiveScalarFunction<UDFType> extends ScalarFunction
 
         // When the parameter is (Integer, Array[Double]), Flink calls udf.eval(Integer,
         // Array[Double]), which is not a problem.
-        // But when the parameter is an single array, Flink calls udf.eval(Array[Double]),
+        // But when the parameter is a single array, Flink calls udf.eval(Array[Double]),
         // at this point java's var-args will cast Array[Double] to Array[Object] and let it be
         // Object... args, So we need wrap it.
         if (isArgsSingleArray) {

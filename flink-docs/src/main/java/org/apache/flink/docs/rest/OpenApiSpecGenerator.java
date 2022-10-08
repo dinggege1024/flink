@@ -37,13 +37,12 @@ import org.apache.flink.runtime.rest.messages.MessageQueryParameter;
 import org.apache.flink.runtime.rest.messages.TriggerId;
 import org.apache.flink.runtime.rest.messages.job.JobSubmitHeaders;
 import org.apache.flink.runtime.rest.messages.json.SerializedThrowableSerializer;
-import org.apache.flink.runtime.rest.util.DocumentingDispatcherRestEndpoint;
 import org.apache.flink.runtime.rest.util.DocumentingRestEndpoint;
 import org.apache.flink.runtime.rest.versioning.RestAPIVersion;
 import org.apache.flink.runtime.util.EnvironmentInformation;
 import org.apache.flink.runtime.webmonitor.handlers.JarUploadHeaders;
-import org.apache.flink.util.ConfigurationException;
 import org.apache.flink.util.SerializedThrowable;
+import org.apache.flink.util.jackson.JacksonMapperFactory;
 
 import org.apache.flink.shaded.jackson2.com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.flink.shaded.jackson2.com.fasterxml.jackson.databind.SerializationFeature;
@@ -76,14 +75,15 @@ import java.lang.reflect.Type;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.stream.Collectors;
 
@@ -100,32 +100,10 @@ public class OpenApiSpecGenerator {
     static {
         ModelResolver.enumsAsRef = true;
         final ObjectMapper mapper =
-                new ObjectMapper().configure(SerializationFeature.ORDER_MAP_ENTRIES_BY_KEYS, true);
+                JacksonMapperFactory.createObjectMapper()
+                        .configure(SerializationFeature.ORDER_MAP_ENTRIES_BY_KEYS, true);
         modelConverterContext =
                 new ModelConverterContextImpl(Collections.singletonList(new ModelResolver(mapper)));
-    }
-
-    /**
-     * Generates the REST API OpenAPI spec.
-     *
-     * @param args args[0] contains the directory into which the generated files are placed
-     * @throws IOException if any file operation failed
-     */
-    public static void main(String[] args) throws IOException, ConfigurationException {
-        String outputDirectory = args[0];
-
-        for (final RestAPIVersion apiVersion : RestAPIVersion.values()) {
-            if (apiVersion == RestAPIVersion.V0) {
-                // this version exists only for testing purposes
-                continue;
-            }
-            createDocumentationFile(
-                    new DocumentingDispatcherRestEndpoint(),
-                    apiVersion,
-                    Paths.get(
-                            outputDirectory,
-                            "rest_" + apiVersion.getURLVersionPrefix() + "_dispatcher.yml"));
-        }
     }
 
     @VisibleForTesting
@@ -159,8 +137,36 @@ public class OpenApiSpecGenerator {
         overrideIdSchemas(openApi);
         overrideSerializeThrowableSchema(openApi);
 
+        sortProperties(openApi);
+        sortSchemas(openApi);
+
         Files.deleteIfExists(outputFile);
         Files.write(outputFile, Yaml.pretty(openApi).getBytes(StandardCharsets.UTF_8));
+    }
+
+    @SuppressWarnings("rawtypes")
+    private static void sortProperties(OpenAPI openApi) {
+        for (Schema<?> schema : openApi.getComponents().getSchemas().values()) {
+            final Map<String, Schema> properties = schema.getProperties();
+            if (properties != null) {
+                final LinkedHashMap<String, Schema> sortedMap = new LinkedHashMap<>();
+                properties.entrySet().stream()
+                        .sorted(Map.Entry.comparingByKey())
+                        .forEach(entry -> sortedMap.put(entry.getKey(), entry.getValue()));
+                schema.setProperties(sortedMap);
+            }
+        }
+    }
+
+    @SuppressWarnings("rawtypes")
+    private static void sortSchemas(OpenAPI openApi) {
+        Components components = openApi.getComponents();
+        Map<String, Schema> schemas = components.getSchemas();
+        final LinkedHashMap<String, Schema> sortedSchemas = new LinkedHashMap<>();
+        schemas.entrySet().stream()
+                .sorted(Map.Entry.comparingByKey())
+                .forEach(entry -> sortedSchemas.put(entry.getKey(), entry.getValue()));
+        components.setSchemas(sortedSchemas);
     }
 
     private static boolean shouldBeDocumented(MessageHeaders spec) {
@@ -451,6 +457,8 @@ public class OpenApiSpecGenerator {
                 return PathItem.HttpMethod.DELETE;
             case PATCH:
                 return PathItem.HttpMethod.PATCH;
+            case PUT:
+                return PathItem.HttpMethod.PUT;
         }
         throw new IllegalArgumentException("not supported");
     }

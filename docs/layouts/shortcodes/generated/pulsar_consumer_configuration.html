@@ -58,7 +58,7 @@
         </tr>
         <tr>
             <td><h5>pulsar.consumer.deadLetterPolicy.maxRedeliverCount</h5></td>
-            <td style="word-wrap: break-word;">0</td>
+            <td style="word-wrap: break-word;">(none)</td>
             <td>Integer</td>
             <td>The maximum number of times that a message are redelivered before being sent to the dead letter queue.</td>
         </tr>
@@ -139,12 +139,6 @@ C5, 1, 1
             <td style="word-wrap: break-word;">false</td>
             <td>Boolean</td>
             <td>If enabled, the consumer will automatically retry messages.</td>
-        </tr>
-        <tr>
-            <td><h5>pulsar.consumer.subscriptionInitialPosition</h5></td>
-            <td style="word-wrap: break-word;">Latest</td>
-            <td><p>Enum</p></td>
-            <td>Initial position at which to set cursor when subscribing to a topic at first time.<br /><br />Possible values:<ul><li>"Latest"</li><li>"Earliest"</li></ul></td>
         </tr>
         <tr>
             <td><h5>pulsar.consumer.subscriptionMode</h5></td>

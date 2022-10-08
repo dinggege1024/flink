@@ -2892,9 +2892,9 @@ env.execute()
 ```python
 from pyflink.common import Encoder
 from pyflink.datastream import StreamExecutionEnvironment
-from pyflink.datastream.connectors import StreamingFileSink
+from pyflink.datastream.connectors.file_system import FileSink
 from pyflink.table import StreamTableEnvironment, TableDescriptor, Schema, DataTypes
-    
+
 env = StreamExecutionEnvironment.get_execution_environment()
 table_env = StreamTableEnvironment.create(env)
 
@@ -2923,11 +2923,15 @@ data_stream = env.from_collection([1, 2, 3])
 table_from_stream = table_env.from_data_stream(data_stream)
 statement_set.add_insert(sink_descriptor, table_from_stream)
 
+# attach both pipelines to StreamExecutionEnvironment
+# (the statement set will be cleared after calling this method)
+statement_set.attach_as_datastream()
+
 # define other DataStream API parts
-env.from_collection([4, 5, 6])
-    .add_sink(StreamingFileSink
-              .for_row_format('/tmp/output', Encoder.simple_string_encoder())
-              .build())
+env.from_collection([4, 5, 6]) \
+   .add_sink(FileSink
+             .for_row_format('/tmp/output', Encoder.simple_string_encoder())
+             .build())
 
 # use DataStream API to submit the pipelines
 env.execute()

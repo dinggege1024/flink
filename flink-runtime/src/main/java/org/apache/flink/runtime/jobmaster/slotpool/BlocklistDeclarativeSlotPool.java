@@ -31,13 +31,10 @@ import org.apache.flink.runtime.taskmanager.TaskManagerLocation;
 import org.apache.flink.runtime.util.ResourceCounter;
 import org.apache.flink.util.FlinkRuntimeException;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
 import javax.annotation.Nullable;
 
+import java.util.ArrayList;
 import java.util.Collection;
-import java.util.Collections;
 import java.util.Optional;
 import java.util.function.Consumer;
 
@@ -50,8 +47,6 @@ import static org.apache.flink.util.Preconditions.checkNotNull;
  * blocked nodes.
  */
 public class BlocklistDeclarativeSlotPool extends DefaultDeclarativeSlotPool {
-
-    private static final Logger LOG = LoggerFactory.getLogger(BlocklistDeclarativeSlotPool.class);
 
     private final BlockedTaskManagerChecker blockedTaskManagerChecker;
 
@@ -75,9 +70,7 @@ public class BlocklistDeclarativeSlotPool extends DefaultDeclarativeSlotPool {
         if (!isBlockedTaskManager(taskManagerLocation.getResourceID())) {
             return super.offerSlots(offers, taskManagerLocation, taskManagerGateway, currentTime);
         } else {
-            LOG.debug(
-                    "Reject slots {} from a blocked TaskManager {}.", offers, taskManagerLocation);
-            return Collections.emptySet();
+            return internalOfferSlotsFromBlockedTaskManager(offers, taskManagerLocation);
         }
     }
 
@@ -90,9 +83,37 @@ public class BlocklistDeclarativeSlotPool extends DefaultDeclarativeSlotPool {
         if (!isBlockedTaskManager(taskManagerLocation.getResourceID())) {
             return super.registerSlots(slots, taskManagerLocation, taskManagerGateway, currentTime);
         } else {
-            LOG.debug("Reject slots {} from a blocked TaskManager {}.", slots, taskManagerLocation);
-            return Collections.emptySet();
+            return internalOfferSlotsFromBlockedTaskManager(slots, taskManagerLocation);
         }
+    }
+
+    private Collection<SlotOffer> internalOfferSlotsFromBlockedTaskManager(
+            Collection<? extends SlotOffer> offers, TaskManagerLocation taskManagerLocation) {
+        final Collection<SlotOffer> acceptedSlotOffers = new ArrayList<>();
+        final Collection<SlotOffer> rejectedSlotOffers = new ArrayList<>();
+
+        // we should accept a duplicate (already accepted) slot, even if it's from a currently
+        // blocked task manager. Because the slot may already be assigned to an execution, rejecting
+        // it will cause a task failover.
+        for (SlotOffer offer : offers) {
+            if (slotPool.containsSlot(offer.getAllocationId())) {
+                // we have already accepted this offer
+                acceptedSlotOffers.add(offer);
+            } else {
+                rejectedSlotOffers.add(offer);
+            }
+        }
+
+        log.debug(
+                "Received {} slots from a blocked TaskManager {}, {} was accepted before: {}, {} was rejected: {}.",
+                offers.size(),
+                taskManagerLocation,
+                acceptedSlotOffers.size(),
+                acceptedSlotOffers,
+                rejectedSlotOffers.size(),
+                rejectedSlotOffers);
+
+        return acceptedSlotOffers;
     }
 
     @Override
@@ -108,7 +129,7 @@ public class BlocklistDeclarativeSlotPool extends DefaultDeclarativeSlotPool {
         if (!isBlockedTaskManager(taskManagerId)) {
             return super.freeReservedSlot(allocationId, cause, currentTime);
         } else {
-            LOG.debug("Free reserved slot {}.", allocationId);
+            log.debug("Free reserved slot {}.", allocationId);
             return releaseSlot(
                     allocationId,
                     new FlinkRuntimeException(

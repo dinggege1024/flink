@@ -22,8 +22,24 @@ import java.time.Duration;
 
 /** Configuration for hybrid shuffle mode. */
 public class HybridShuffleConfiguration {
-    private static final int MAX_BUFFERS_READ_AHEAD = 5;
+    private static final int DEFAULT_MAX_BUFFERS_READ_AHEAD = 5;
+
     private static final Duration DEFAULT_BUFFER_REQUEST_TIMEOUT = Duration.ofMillis(5);
+
+    private static final float DEFAULT_SELECTIVE_STRATEGY_SPILL_THRESHOLD = 0.7f;
+
+    private static final float DEFAULT_SELECTIVE_STRATEGY_SPILL_BUFFER_RATIO = 0.4f;
+
+    private static final float DEFAULT_FULL_STRATEGY_NUM_BUFFERS_TRIGGER_SPILLED_RATIO = 0.5f;
+
+    private static final float DEFAULT_FULL_STRATEGY_RELEASE_THRESHOLD = 0.7f;
+
+    private static final float DEFAULT_FULL_STRATEGY_RELEASE_BUFFER_RATIO = 0.4f;
+
+    private static final long DEFAULT_BUFFER_POLL_SIZE_CHECK_INTERVAL_MS = 1000;
+
+    private static final SpillingStrategyType DEFAULT_SPILLING_STRATEGY_NAME =
+            SpillingStrategyType.FULL;
 
     private final int maxBuffersReadAhead;
 
@@ -31,28 +47,57 @@ public class HybridShuffleConfiguration {
 
     private final int maxRequestedBuffers;
 
-    public HybridShuffleConfiguration(
-            int maxBuffersReadAhead, Duration bufferRequestTimeout, int maxRequestedBuffers) {
+    private final SpillingStrategyType spillingStrategyType;
+
+    // ----------------------------------------
+    //        Selective Spilling Strategy
+    // ----------------------------------------
+    private final float selectiveStrategySpillThreshold;
+
+    private final float selectiveStrategySpillBufferRatio;
+
+    // ----------------------------------------
+    //        Full Spilling Strategy
+    // ----------------------------------------
+    private final float fullStrategyNumBuffersTriggerSpillingRatio;
+
+    private final float fullStrategyReleaseThreshold;
+
+    private final float fullStrategyReleaseBufferRatio;
+
+    private final long bufferPoolSizeCheckIntervalMs;
+
+    private HybridShuffleConfiguration(
+            int maxBuffersReadAhead,
+            Duration bufferRequestTimeout,
+            int maxRequestedBuffers,
+            float selectiveStrategySpillThreshold,
+            float selectiveStrategySpillBufferRatio,
+            float fullStrategyNumBuffersTriggerSpillingRatio,
+            float fullStrategyReleaseThreshold,
+            float fullStrategyReleaseBufferRatio,
+            SpillingStrategyType spillingStrategyType,
+            long bufferPoolSizeCheckIntervalMs) {
         this.maxBuffersReadAhead = maxBuffersReadAhead;
         this.bufferRequestTimeout = bufferRequestTimeout;
         this.maxRequestedBuffers = maxRequestedBuffers;
+        this.selectiveStrategySpillThreshold = selectiveStrategySpillThreshold;
+        this.selectiveStrategySpillBufferRatio = selectiveStrategySpillBufferRatio;
+        this.fullStrategyNumBuffersTriggerSpillingRatio =
+                fullStrategyNumBuffersTriggerSpillingRatio;
+        this.fullStrategyReleaseThreshold = fullStrategyReleaseThreshold;
+        this.fullStrategyReleaseBufferRatio = fullStrategyReleaseBufferRatio;
+        this.spillingStrategyType = spillingStrategyType;
+        this.bufferPoolSizeCheckIntervalMs = bufferPoolSizeCheckIntervalMs;
     }
 
-    /**
-     * Temporarily adopt a fixed value, and then adjust the default value according to the
-     * experiment, and introduce configuration options.
-     */
-    public static HybridShuffleConfiguration createConfiguration(
-            int numSubpartitions, int numBuffersPerRequest, Duration bufferRequestTimeout) {
-        final int maxRequestedBuffers = Math.max(2 * numBuffersPerRequest, numSubpartitions);
-        return new HybridShuffleConfiguration(
-                MAX_BUFFERS_READ_AHEAD, bufferRequestTimeout, maxRequestedBuffers);
+    public static Builder builder(int numSubpartitions, int numBuffersPerRequest) {
+        return new Builder(numSubpartitions, numBuffersPerRequest);
     }
 
-    public static HybridShuffleConfiguration createConfiguration(
-            int numSubpartitions, int numBuffersPerRequest) {
-        return createConfiguration(
-                numSubpartitions, numBuffersPerRequest, DEFAULT_BUFFER_REQUEST_TIMEOUT);
+    /** Get {@link SpillingStrategyType} for hybrid shuffle mode. */
+    public SpillingStrategyType getSpillingStrategyType() {
+        return spillingStrategyType;
     }
 
     public int getMaxRequestedBuffers() {
@@ -73,5 +118,144 @@ public class HybridShuffleConfiguration {
      */
     public Duration getBufferRequestTimeout() {
         return bufferRequestTimeout;
+    }
+
+    /**
+     * When the number of buffers that have been requested exceeds this threshold, trigger the
+     * spilling operation. Used by {@link HsSelectiveSpillingStrategy}.
+     */
+    public float getSelectiveStrategySpillThreshold() {
+        return selectiveStrategySpillThreshold;
+    }
+
+    /** The proportion of buffers to be spilled. Used by {@link HsSelectiveSpillingStrategy}. */
+    public float getSelectiveStrategySpillBufferRatio() {
+        return selectiveStrategySpillBufferRatio;
+    }
+
+    /**
+     * When the number of unSpilled buffers equal to this ratio times pool size, trigger the
+     * spilling operation. Used by {@link HsFullSpillingStrategy}.
+     */
+    public float getFullStrategyNumBuffersTriggerSpillingRatio() {
+        return fullStrategyNumBuffersTriggerSpillingRatio;
+    }
+
+    /**
+     * When the number of buffers that have been requested exceeds this threshold, trigger the
+     * release operation. Used by {@link HsFullSpillingStrategy}.
+     */
+    public float getFullStrategyReleaseThreshold() {
+        return fullStrategyReleaseThreshold;
+    }
+
+    /** The proportion of buffers to be released. Used by {@link HsFullSpillingStrategy}. */
+    public float getFullStrategyReleaseBufferRatio() {
+        return fullStrategyReleaseBufferRatio;
+    }
+
+    /** Check interval of buffer pool's size. */
+    public long getBufferPoolSizeCheckIntervalMs() {
+        return bufferPoolSizeCheckIntervalMs;
+    }
+
+    /** Type of {@link HsSpillingStrategy}. */
+    public enum SpillingStrategyType {
+        FULL,
+        SELECTIVE
+    }
+
+    /** Builder for {@link HybridShuffleConfiguration}. */
+    public static class Builder {
+        private int maxBuffersReadAhead = DEFAULT_MAX_BUFFERS_READ_AHEAD;
+
+        private Duration bufferRequestTimeout = DEFAULT_BUFFER_REQUEST_TIMEOUT;
+
+        private float selectiveStrategySpillThreshold = DEFAULT_SELECTIVE_STRATEGY_SPILL_THRESHOLD;
+
+        private float selectiveStrategySpillBufferRatio =
+                DEFAULT_SELECTIVE_STRATEGY_SPILL_BUFFER_RATIO;
+
+        private float fullStrategyNumBuffersTriggerSpillingRatio =
+                DEFAULT_FULL_STRATEGY_NUM_BUFFERS_TRIGGER_SPILLED_RATIO;
+
+        private float fullStrategyReleaseThreshold = DEFAULT_FULL_STRATEGY_RELEASE_THRESHOLD;
+
+        private float fullStrategyReleaseBufferRatio = DEFAULT_FULL_STRATEGY_RELEASE_BUFFER_RATIO;
+
+        private long bufferPoolSizeCheckIntervalMs = DEFAULT_BUFFER_POLL_SIZE_CHECK_INTERVAL_MS;
+
+        private SpillingStrategyType spillingStrategyType = DEFAULT_SPILLING_STRATEGY_NAME;
+
+        private final int numSubpartitions;
+
+        private final int numBuffersPerRequest;
+
+        private Builder(int numSubpartitions, int numBuffersPerRequest) {
+            this.numSubpartitions = numSubpartitions;
+            this.numBuffersPerRequest = numBuffersPerRequest;
+        }
+
+        public Builder setMaxBuffersReadAhead(int maxBuffersReadAhead) {
+            this.maxBuffersReadAhead = maxBuffersReadAhead;
+            return this;
+        }
+
+        public Builder setBufferRequestTimeout(Duration bufferRequestTimeout) {
+            this.bufferRequestTimeout = bufferRequestTimeout;
+            return this;
+        }
+
+        public Builder setSelectiveStrategySpillThreshold(float selectiveStrategySpillThreshold) {
+            this.selectiveStrategySpillThreshold = selectiveStrategySpillThreshold;
+            return this;
+        }
+
+        public Builder setSelectiveStrategySpillBufferRatio(
+                float selectiveStrategySpillBufferRatio) {
+            this.selectiveStrategySpillBufferRatio = selectiveStrategySpillBufferRatio;
+            return this;
+        }
+
+        public Builder setFullStrategyNumBuffersTriggerSpillingRatio(
+                float fullStrategyNumBuffersTriggerSpillingRatio) {
+            this.fullStrategyNumBuffersTriggerSpillingRatio =
+                    fullStrategyNumBuffersTriggerSpillingRatio;
+            return this;
+        }
+
+        public Builder setFullStrategyReleaseThreshold(float fullStrategyReleaseThreshold) {
+            this.fullStrategyReleaseThreshold = fullStrategyReleaseThreshold;
+            return this;
+        }
+
+        public Builder setFullStrategyReleaseBufferRatio(float fullStrategyReleaseBufferRatio) {
+            this.fullStrategyReleaseBufferRatio = fullStrategyReleaseBufferRatio;
+            return this;
+        }
+
+        public Builder setSpillingStrategyType(SpillingStrategyType spillingStrategyType) {
+            this.spillingStrategyType = spillingStrategyType;
+            return this;
+        }
+
+        public Builder setBufferPoolSizeCheckIntervalMs(long bufferPoolSizeCheckIntervalMs) {
+            this.bufferPoolSizeCheckIntervalMs = bufferPoolSizeCheckIntervalMs;
+            return this;
+        }
+
+        public HybridShuffleConfiguration build() {
+            return new HybridShuffleConfiguration(
+                    maxBuffersReadAhead,
+                    bufferRequestTimeout,
+                    Math.max(2 * numBuffersPerRequest, numSubpartitions),
+                    selectiveStrategySpillThreshold,
+                    selectiveStrategySpillBufferRatio,
+                    fullStrategyNumBuffersTriggerSpillingRatio,
+                    fullStrategyReleaseThreshold,
+                    fullStrategyReleaseBufferRatio,
+                    spillingStrategyType,
+                    bufferPoolSizeCheckIntervalMs);
+        }
     }
 }

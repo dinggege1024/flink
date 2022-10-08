@@ -19,6 +19,9 @@ package org.apache.flink.connector.base.sink.writer;
 
 import org.apache.flink.api.common.operators.MailboxExecutor;
 import org.apache.flink.api.connector.sink2.Sink;
+import org.apache.flink.connector.base.sink.writer.config.AsyncSinkWriterConfiguration;
+import org.apache.flink.connector.base.sink.writer.strategy.AIMDScalingStrategy;
+import org.apache.flink.connector.base.sink.writer.strategy.CongestionControlRateLimitingStrategy;
 import org.apache.flink.streaming.runtime.tasks.TestProcessingTimeService;
 
 import org.junit.jupiter.api.BeforeEach;
@@ -1023,12 +1026,25 @@ public class AsyncSinkWriterTest {
             super(
                     (elem, ctx) -> Integer.parseInt(elem),
                     context,
-                    maxBatchSize,
-                    maxInFlightRequests,
-                    maxBufferedRequests,
-                    maxBatchSizeInBytes,
-                    maxTimeInBufferMS,
-                    maxRecordSizeInBytes,
+                    AsyncSinkWriterConfiguration.builder()
+                            .setMaxBatchSize(maxBatchSize)
+                            .setMaxBatchSizeInBytes(maxBatchSizeInBytes)
+                            .setMaxInFlightRequests(maxInFlightRequests)
+                            .setMaxBufferedRequests(maxBufferedRequests)
+                            .setMaxTimeInBufferMS(maxTimeInBufferMS)
+                            .setMaxRecordSizeInBytes(maxRecordSizeInBytes)
+                            .setRateLimitingStrategy(
+                                    CongestionControlRateLimitingStrategy.builder()
+                                            .setInitialMaxInFlightMessages(
+                                                    maxBatchSize * maxInFlightRequests)
+                                            .setMaxInFlightRequests(maxInFlightRequests)
+                                            .setScalingStrategy(
+                                                    AIMDScalingStrategy.builder(
+                                                                    maxBatchSize
+                                                                            * maxInFlightRequests)
+                                                            .build())
+                                            .build())
+                            .build(),
                     bufferedState);
             this.simulateFailures = simulateFailures;
             this.delay = delay;
@@ -1059,12 +1075,12 @@ public class AsyncSinkWriterTest {
          * <p>A limitation of this basic implementation is that each element written must be unique.
          *
          * @param requestEntries a set of request entries that should be persisted to {@code res}
-         * @param requestResult a Consumer that needs to accept a collection of failure elements
+         * @param requestToRetry a Consumer that needs to accept a collection of failure elements
          *     once all request entries have been persisted
          */
         @Override
         protected void submitRequestEntries(
-                List<Integer> requestEntries, Consumer<List<Integer>> requestResult) {
+                List<Integer> requestEntries, Consumer<List<Integer>> requestToRetry) {
             maybeDelay();
 
             if (requestEntries.stream().anyMatch(val -> val > 100 && val <= 200)) {
@@ -1087,10 +1103,10 @@ public class AsyncSinkWriterTest {
 
                 requestEntries.removeAll(firstTimeFailed);
                 res.addAll(requestEntries);
-                requestResult.accept(firstTimeFailed);
+                requestToRetry.accept(firstTimeFailed);
             } else {
                 res.addAll(requestEntries);
-                requestResult.accept(new ArrayList<>());
+                requestToRetry.accept(new ArrayList<>());
             }
         }
 
@@ -1239,7 +1255,7 @@ public class AsyncSinkWriterTest {
 
         @Override
         protected void submitRequestEntries(
-                List<Integer> requestEntries, Consumer<List<Integer>> requestResult) {
+                List<Integer> requestEntries, Consumer<List<Integer>> requestToRetry) {
             if (requestEntries.size() == 3) {
                 try {
                     delayedStartLatch.countDown();
@@ -1258,7 +1274,7 @@ public class AsyncSinkWriterTest {
             }
 
             res.addAll(requestEntries);
-            requestResult.accept(new ArrayList<>());
+            requestToRetry.accept(new ArrayList<>());
         }
     }
 }
